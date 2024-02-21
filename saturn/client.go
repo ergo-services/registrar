@@ -31,7 +31,7 @@ type Options struct {
 	InsecureSkipVerify bool
 }
 
-func CreateClient(host string, token string, options Options) gen.RegistrarClient {
+func Create(host string, token string, options Options) gen.Registrar {
 	if options.Port == 0 {
 		options.Port = defaultRegistrarPort
 	}
@@ -343,8 +343,8 @@ func (c *client) Event() (gen.Event, error) {
 }
 func (c *client) Info() gen.RegistrarInfo {
 	return gen.RegistrarInfo{
-		LocalServer: false,
-		Version:     c.Version(),
+		EmbeddedServer: false,
+		Version:        c.Version(),
 	}
 }
 
