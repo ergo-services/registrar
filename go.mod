@@ -2,4 +2,4 @@ module ergo.services/registrar
 
 go 1.20
 
-require ergo.services/ergo v1.999.225-0.20240606191206-1e15b2a6774b
+require ergo.services/ergo v1.999.225-0.20240626203831-33081e2084e5
