@@ -139,8 +139,11 @@ func (c *client) ResolveApplication(name gen.Atom) ([]gen.ApplicationRoute, erro
 	defer c.RUnlock()
 
 	if ar, found := c.apps[name]; found {
-		return ar, nil
+		arcopy := make([]gen.ApplicationRoute, len(ar))
+		copy(arcopy, ar)
+		return arcopy, nil
 	}
+
 	return nil, gen.ErrNoRoute
 }
 
@@ -195,45 +198,29 @@ func (c *client) UnregisterProxy(to gen.Atom) error {
 	return gen.ErrUnsupported
 }
 
-func (c *client) RegisterApplication(route gen.ApplicationRoute) error {
+func (c *client) RegisterApplicationRoute(route gen.ApplicationRoute) error {
 	if c.isHandlerTerminated() {
 		return gen.ErrRegistrarTerminated
 	}
 
 	c.node.Log().Trace("(saturn) register application route for %s", route.Name)
 
-	c.Lock()
-	c.routes.ApplicationRoutes = append(c.routes.ApplicationRoutes, route)
-	c.Unlock()
-
-	mra := MessageRegisterApplication{
+	mra := MessageRegisterApplicationRoute{
 		Route: route,
 	}
 	c.queue.Push(mra)
 	c.handle()
 	return nil
 }
-func (c *client) UnregisterApplication(name gen.Atom, reason error) error {
+func (c *client) UnregisterApplicationRoute(name gen.Atom) error {
 	if c.isHandlerTerminated() {
 		return gen.ErrRegistrarTerminated
 	}
 
 	c.node.Log().Trace("(saturn) unregister application route for %s", name)
 
-	c.Lock()
-	for i := range c.routes.ApplicationRoutes {
-		if c.routes.ApplicationRoutes[i].Name != name {
-			continue
-		}
-		c.routes.ApplicationRoutes[i] = c.routes.ApplicationRoutes[0]
-		c.routes.ApplicationRoutes = c.routes.ApplicationRoutes[1:]
-		break
-	}
-	c.Unlock()
-
-	mua := MessageUnregisterApplication{
-		Name:   name,
-		Reason: reason,
+	mua := MessageUnregisterApplicationRoute{
+		Name: name,
 	}
 	c.queue.Push(mua)
 	c.handle()
@@ -250,7 +237,7 @@ func (c *client) Nodes() ([]gen.Atom, error) {
 	c.RLock()
 	defer c.RUnlock()
 
-	for n, _ := range c.nodes {
+	for n := range c.nodes {
 		nodes = append(nodes, n)
 	}
 	return nodes, nil
@@ -342,14 +329,23 @@ func (c *client) Event() (gen.Event, error) {
 	return c.event, nil
 }
 func (c *client) Info() gen.RegistrarInfo {
+	var server string
+	if c.conn != nil {
+		server = c.conn.RemoteAddr().String()
+	}
 	return gen.RegistrarInfo{
-		EmbeddedServer: false,
-		Version:        c.Version(),
+		Server:                     server,
+		EmbeddedServer:             false,
+		Version:                    c.Version(),
+		SupportConfig:              true,
+		SupportEvent:               true,
+		SupportRegisterProxy:       true,
+		SupportRegisterApplication: true,
 	}
 }
 
 //
-// gen.RegistrarClient interface implementation
+// gen.Registrar interface implementation
 //
 
 func (c *client) Register(node gen.NodeRegistrar, routes gen.RegisterRoutes) (gen.StaticRoutes, error) {
@@ -767,30 +763,72 @@ func (c *client) serve(conn net.Conn) {
 					c.node.Log().Error("(saturn) unable to send event with cluster node update: %s", err)
 				}
 
-			case MessageApplicationStarted:
+			case MessageRegisterApplicationRoute:
 				c.Lock()
-				// started
-				routes := c.apps[m.Route.Name]
-				routes = append(routes, m.Route)
-				c.apps[m.Route.Name] = routes
-				c.node.Log().Trace("(saturn) added application route for %s (application started on %s)", m.Route.Name, m.Route.Node)
-				c.Unlock()
 
-				if err := c.node.SendEvent(c.event.Name, c.eventRef, gen.MessageOptions{}, m); err != nil {
-					c.node.Log().Error("(saturn) unable to send event with application route update: %s", err)
+				routes, found := c.apps[m.Route.Name]
+
+				for i := range routes {
+					if routes[i].Node != m.Route.Node {
+						continue
+					}
+					found = true
+					routes[i] = m.Route
+					c.node.Log().Trace("(saturn) updated application route for %s (application running on %s)", m.Route.Name, m.Route.Node)
+					break
 				}
 
-			case MessageApplicationTerminated:
-				routes := c.apps[m.Name]
+				if found == false {
+					routes = append(routes, m.Route)
+					c.apps[m.Route.Name] = routes
+					c.node.Log().Trace("(saturn) added application route for %s (application started on %s)", m.Route.Name, m.Route.Node)
+				}
+				c.Unlock()
+
+				switch m.Route.State {
+				case gen.ApplicationStateLoaded:
+					if found == false {
+						ev := EventApplicationLoaded{
+							Name:   m.Route.Name,
+							Node:   m.Route.Node,
+							Weight: m.Route.Weight,
+						}
+						c.node.SendEvent(c.event.Name, c.eventRef, gen.MessageOptions{}, ev)
+						break
+					}
+					ev := EventApplicationStopped{
+						Name: m.Route.Name,
+						Node: m.Route.Node,
+					}
+					c.node.SendEvent(c.event.Name, c.eventRef, gen.MessageOptions{}, ev)
+				case gen.ApplicationStateStopping:
+					ev := EventApplicationStopping{
+						Name: m.Route.Name,
+						Node: m.Route.Node,
+					}
+					c.node.SendEvent(c.event.Name, c.eventRef, gen.MessageOptions{}, ev)
+				case gen.ApplicationStateRunning:
+					ev := EventApplicationStarted{
+						Name:   m.Route.Name,
+						Node:   m.Route.Node,
+						Weight: m.Route.Weight,
+						Mode:   m.Route.Mode,
+					}
+					c.node.SendEvent(c.event.Name, c.eventRef, gen.MessageOptions{}, ev)
+				}
+
+			case MessageUnregisterApplicationRoute:
 				c.Lock()
+				routes, found := c.apps[m.Name]
 				for i := range routes {
 					if routes[i].Node != m.Node {
 						continue
 					}
-					c.node.Log().Trace("(saturn) remove application route for %s (application stopped on %s with reason %s)",
-						m.Name, m.Node, m.Reason)
+					c.node.Log().Trace("(saturn) remove application route for %s (application stopped on %s )",
+						m.Name, m.Node)
 					routes[0] = routes[i]
 					routes = routes[1:]
+					found = true
 
 					if len(routes) == 0 {
 						delete(c.apps, m.Name)
@@ -802,9 +840,14 @@ func (c *client) serve(conn net.Conn) {
 				}
 				c.Unlock()
 
-				if err := c.node.SendEvent(c.event.Name, c.eventRef, gen.MessageOptions{}, m); err != nil {
-					c.node.Log().Error("(saturn) unable to send event with application route update: %s", err)
+				if found == false {
+					break
 				}
+				ev := EventApplicationUnloaded{
+					Name: m.Name,
+					Node: m.Node,
+				}
+				c.node.SendEvent(c.event.Name, c.eventRef, gen.MessageOptions{}, ev)
 
 			default:
 				c.node.Log().Error("(saturn) unknown message from registrar: %#v", m)
@@ -826,6 +869,7 @@ func (c *client) serve(conn net.Conn) {
 		// clean it up by making the new ones
 		c.nodes = make(map[gen.Atom]bool)
 		c.apps = make(map[gen.Atom][]gen.ApplicationRoute)
+		c.conn = nil
 
 		// trying to reconnect
 		reconnectTimeout := time.Second

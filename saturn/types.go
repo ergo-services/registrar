@@ -55,15 +55,6 @@ type MessageUnregisterProxy struct {
 	Route gen.ProxyRoute
 }
 
-type MessageRegisterApplication struct {
-	Route gen.ApplicationRoute
-}
-
-type MessageUnregisterApplication struct {
-	Name   gen.Atom
-	Reason error
-}
-
 type MessageResolve struct {
 	ID   uint32
 	Name gen.Atom
@@ -91,14 +82,13 @@ type MessageConfigUpdate struct {
 	Value any
 }
 
-type MessageApplicationStarted struct {
+type MessageRegisterApplicationRoute struct {
 	Route gen.ApplicationRoute
 }
 
-type MessageApplicationTerminated struct {
-	Name   gen.Atom
-	Node   gen.Atom
-	Reason error
+type MessageUnregisterApplicationRoute struct {
+	Name gen.Atom
+	Node gen.Atom
 }
 
 type MessageNodeJoined struct {
@@ -108,6 +98,8 @@ type MessageNodeJoined struct {
 type MessageNodeLeft struct {
 	Node gen.Atom
 }
+
+// local messages
 
 type EventConfigUpdate struct {
 	Item  string
@@ -122,21 +114,48 @@ type EventNodeLeft struct {
 	Name gen.Atom
 }
 
+type EventApplicationLoaded struct {
+	Name   gen.Atom
+	Node   gen.Atom
+	Weight int
+}
+
+type EventApplicationStarted struct {
+	Name   gen.Atom
+	Node   gen.Atom
+	Weight int
+	Mode   gen.ApplicationMode
+}
+
+type EventApplicationStopping struct {
+	Name gen.Atom
+	Node gen.Atom
+}
+
+type EventApplicationStopped struct {
+	Name gen.Atom
+	Node gen.Atom
+}
+
+type EventApplicationUnloaded struct {
+	Name gen.Atom
+	Node gen.Atom
+}
+
 func init() {
 	types := []any{
 		MessageHandshake{},
 		MessageHandshakeResult{},
 		MessageRegister{},
 		MessageRegisterResult{},
-		MessageRegisterApplication{},
 		MessageResolve{},
 		MessageResolveResult{},
 		MessageResolveProxy{},
 		MessageResolveProxyResult{},
 		MessageNodeJoined{},
 		MessageNodeLeft{},
-		MessageApplicationStarted{},
-		MessageApplicationTerminated{},
+		MessageRegisterApplicationRoute{},
+		MessageUnregisterApplicationRoute{},
 		MessageConfigUpdate{},
 	}
 
