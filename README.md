@@ -15,5 +15,5 @@ This is a client library for the central registrar [Saturn](https://docs.ergo.se
 
 For commercial or production purposes, it is necessary [to purchase a licence](https://github.com/sponsors/ergo-services).
 
-Doc: https://docs.ergo.services/extra-library/registrar/saturn
+Doc: https://docs.ergo.services/extra-library/registrars/saturn-slient
 
