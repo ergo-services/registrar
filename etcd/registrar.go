@@ -21,7 +21,7 @@ func (c *client) Register(node gen.NodeRegistrar, routes gen.RegisterRoutes) (ge
 	c.node = node
 	static, err := c.tryRegister()
 	if err == nil {
-		eventName := gen.Atom(c.pathCluster)
+		eventName := gen.Atom(c.pathClusterRoutes)
 		eventRef, err := node.RegisterEvent(eventName, gen.EventOptions{})
 		if err != nil {
 			return gen.StaticRoutes{}, err
@@ -222,10 +222,8 @@ func (c *client) keepRegistration() {
 		panic(err)
 	}
 
-	// Watch cluster events and both configuration paths
-	clusterWatchCh := c.cli.Watch(ctx, c.pathCluster, etcdcli.WithPrefix())
-	configWatchCh := c.cli.Watch(ctx, c.pathConfig, etcdcli.WithPrefix())
-	globalConfigWatchCh := c.cli.Watch(ctx, c.pathGlobalConfig, etcdcli.WithPrefix())
+	// Single watcher for all events - watch the common path prefix
+	watchCh := c.cli.Watch(ctx, pathPrefix, etcdcli.WithPrefix())
 
 	// Load initial configuration from both sources
 	c.loadConfiguration()
@@ -238,63 +236,13 @@ func (c *client) keepRegistration() {
 			}
 			continue
 
-		case watchResp, ok := <-clusterWatchCh:
+		case watchResp, ok := <-watchCh:
 			if ok == false {
 				break
 			}
 
 			for _, event := range watchResp.Events {
-				c.node.Log().Debug("(registrar) cluster watch event: %s %s", event.Type, event.Kv.Key)
-				switch event.Type {
-				case etcdcli.EventTypePut:
-					c.node.Log().Info("(registrar) cluster key %s updated", event.Kv.Key)
-					c.handleClusterEvent(event)
-				case etcdcli.EventTypeDelete:
-					c.node.Log().Info("(registrar) cluster key %s deleted", event.Kv.Key)
-					c.handleClusterEvent(event)
-				default:
-					c.node.Log().Warning("(registrar) unknown cluster event type: %s for key %s", event.Type, event.Kv.Key)
-				}
-			}
-			continue
-
-		case watchResp, ok := <-configWatchCh:
-			if ok == false {
-				break
-			}
-
-			for _, event := range watchResp.Events {
-				c.node.Log().Debug("(registrar) config watch event: %s %s", event.Type, event.Kv.Key)
-				switch event.Type {
-				case etcdcli.EventTypePut:
-					c.node.Log().Info("(registrar) config key %s updated", event.Kv.Key)
-					c.handleConfigEvent(event, c.pathConfig)
-				case etcdcli.EventTypeDelete:
-					c.node.Log().Info("(registrar) config key %s deleted", event.Kv.Key)
-					c.handleConfigEvent(event, c.pathConfig)
-				default:
-					c.node.Log().Warning("(registrar) unknown config event type: %s for key %s", event.Type, event.Kv.Key)
-				}
-			}
-			continue
-
-		case watchResp, ok := <-globalConfigWatchCh:
-			if ok == false {
-				break
-			}
-
-			for _, event := range watchResp.Events {
-				c.node.Log().Debug("(registrar) global config watch event: %s %s", event.Type, event.Kv.Key)
-				switch event.Type {
-				case etcdcli.EventTypePut:
-					c.node.Log().Info("(registrar) global config key %s updated", event.Kv.Key)
-					c.handleConfigEvent(event, c.pathGlobalConfig)
-				case etcdcli.EventTypeDelete:
-					c.node.Log().Info("(registrar) global config key %s deleted", event.Kv.Key)
-					c.handleConfigEvent(event, c.pathGlobalConfig)
-				default:
-					c.node.Log().Warning("(registrar) unknown global config event type: %s for key %s", event.Type, event.Kv.Key)
-				}
+				c.handleEvent(event)
 			}
 			continue
 		}
@@ -316,14 +264,35 @@ func (c *client) keepRegistration() {
 				panic(err)
 			}
 
-			clusterWatchCh = c.cli.Watch(ctx, c.pathCluster, etcdcli.WithPrefix())
-			configWatchCh = c.cli.Watch(ctx, c.pathConfig, etcdcli.WithPrefix())
-			globalConfigWatchCh = c.cli.Watch(ctx, c.pathGlobalConfig, etcdcli.WithPrefix())
+			watchCh = c.cli.Watch(ctx, pathPrefix, etcdcli.WithPrefix())
 
 			// Reload configuration after reconnection
 			c.loadConfiguration()
 			break
 		}
+	}
+}
+
+// handleEvent processes all types of events from the single watcher
+func (c *client) handleEvent(event *etcdcli.Event) {
+	key := string(event.Kv.Key)
+
+	// Route based on path prefix
+	switch {
+	case strings.HasPrefix(key, c.pathNodes):
+		c.node.Log().Debug("(registrar) node event: %s %s", event.Type, key)
+		c.handleNodeEvent(event)
+	case strings.HasPrefix(key, c.pathApps):
+		c.node.Log().Debug("(registrar) application event: %s %s", event.Type, key)
+		c.handleApplicationEvent(event)
+	case strings.HasPrefix(key, c.pathConfig):
+		c.node.Log().Debug("(registrar) config event: %s %s", event.Type, key)
+		c.handleConfigEvent(event, c.pathConfig)
+	case strings.HasPrefix(key, c.pathGlobalConfig):
+		c.node.Log().Debug("(registrar) global config event: %s %s", event.Type, key)
+		c.handleConfigEvent(event, c.pathGlobalConfig)
+	default:
+		c.node.Log().Debug("(registrar) ignoring event for unhandled path: %s", key)
 	}
 }
 
@@ -368,12 +337,13 @@ func (c *client) loadConfigFromPath(configPath, configType string) {
 
 		// Filter: only load configurations relevant to this node
 		if !c.isConfigRelevantToNode(configKey, nodename) {
-			c.node.Log().Debug("(registrar) skipping %s config not relevant to node %s: %s", configType, nodename, configKey)
+			c.node.Log().
+				Debug("(registrar) skipping %s config not relevant to node %s: %s", configType, nodename, configKey)
 			continue
 		}
 
 		// Decode the configuration value
-		value, err := decodeConfig(kv.Value)
+		value, err := decodeConfigValue(string(kv.Value))
 		if err != nil {
 			c.node.Log().Error("(registrar) failed to decode %s config value for %s: %v", configType, configKey, err)
 			continue
@@ -441,7 +411,7 @@ func (c *client) handleConfigEvent(event *etcdcli.Event, configPath string) {
 		oldValue, hasOldValue = c.config[configKey]
 
 		// Decode new value
-		newValue, err := decodeConfig(event.Kv.Value)
+		newValue, err := decodeConfigValue(string(event.Kv.Value))
 		if err != nil {
 			c.node.Log().Error("(registrar) failed to decode config value for %s: %v", configKey, err)
 			c.configLock.Unlock()

@@ -6,11 +6,12 @@ A `gen.Registrar` implementation for [etcd](https://etcd.io/) - a distributed, r
 
 - **Distributed Service Discovery**: No single point of failure
 - **Hierarchical Configuration**: Four-level priority system with type conversion
-- **Real-time Events**: Cluster change notifications via etcd watch
+- **Real-time Events**: Cluster change notifications via optimized single watcher
 - **Automatic Cleanup**: Lease-based node registration with TTL
 - **Type Conversion**: `"int:123"` → `int64(123)`, `"float:3.14"` → `float64(3.14)`, `"bool:true"` → `true` from strings
 - **Security**: TLS and authentication support
 - **High Availability**: Built on etcd's proven consensus algorithm
+- **Efficient Watching**: Single watcher with intelligent event routing for minimal resource usage
 
 ## Quick Start
 
@@ -26,12 +27,23 @@ options.Network.Registrar = registrar
 node, err := ergo.StartNode("demo@localhost", options)
 ```
 
-## Configuration Hierarchy
+## Path Structure
 
+### Routes & Service Discovery
+- **Nodes**: `services/ergo/cluster/{cluster}/routes/nodes/{node}`
+- **Applications**: `services/ergo/cluster/{cluster}/routes/applications/{app}/{node}`
+
+### Configuration Hierarchy (Priority: highest → lowest)
 1. Cross-cluster node-specific: `services/ergo/config/{cluster}/{node}/{item}`
 2. Cluster node-specific: `services/ergo/cluster/{cluster}/config/{node}/{item}`  
 3. Cluster-wide default: `services/ergo/cluster/{cluster}/config/*/{item}`
 4. Global default: `services/ergo/config/global/{item}`
+
+### Watch Architecture
+Uses a **single efficient watcher** on `services/ergo` prefix with intelligent event routing:
+- Routes and applications are encoded with `edf.Encode + base64`
+- Configuration values use string encoding with type prefixes
+- Events are automatically routed to appropriate handlers based on path
 
 ## Type Conversion
 
@@ -77,4 +89,4 @@ make clean
 
 ## Documentation
 
-See [documentation](https://docs.ergo.services/extra-library/registrars/etcd) for complete usage guide and examples. 
+See [documentation](https://docs.ergo.services/extra-library/registrars/etcd-client) for complete usage guide and examples. 

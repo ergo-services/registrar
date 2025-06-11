@@ -12,11 +12,13 @@ import (
 )
 
 const (
-	formatPathCluster      = "services/ergo/cluster/%s/"
-	formatPathNodes        = "services/ergo/cluster/%s/nodes/"
-	formatPathApps         = "services/ergo/cluster/%s/applications/"
-	formatPathConfig       = "services/ergo/cluster/%s/config/"
-	formatPathGlobalConfig = "services/ergo/config/"
+	pathPrefix              = "services/ergo"
+	formatPathCluster       = pathPrefix + "/cluster/%s/"
+	formatPathClusterRoutes = pathPrefix + "/cluster/%s/routes/" // Non-overlapping with config
+	formatPathNodes         = pathPrefix + "/cluster/%s/routes/nodes/"
+	formatPathApps          = pathPrefix + "/cluster/%s/routes/applications/"
+	formatPathConfig        = pathPrefix + "/cluster/%s/config/"
+	formatPathGlobalConfig  = pathPrefix + "/config/"
 
 	// Default configuration values
 	defaultDialTimeout    = 10 * time.Second
@@ -61,11 +63,12 @@ type client struct {
 
 	node gen.NodeRegistrar
 
-	pathCluster      string
-	pathNodes        string
-	pathApps         string
-	pathConfig       string
-	pathGlobalConfig string
+	pathCluster       string
+	pathClusterRoutes string // Non-overlapping with config - uses edf.Encode + base64
+	pathNodes         string
+	pathApps          string
+	pathConfig        string // Uses string encoding with type prefixes
+	pathGlobalConfig  string
 
 	routes []gen.Route
 
@@ -157,14 +160,15 @@ func Create(options Options) (gen.Registrar, error) {
 	}
 
 	return &client{
-		options:          options,
-		cli:              cli,
-		pathCluster:      fmt.Sprintf(formatPathCluster, options.Cluster),
-		pathNodes:        fmt.Sprintf(formatPathNodes, options.Cluster),
-		pathApps:         fmt.Sprintf(formatPathApps, options.Cluster),
-		pathConfig:       fmt.Sprintf(formatPathConfig, options.Cluster),
-		pathGlobalConfig: formatPathGlobalConfig,
-		config:           make(map[string]any),
+		options:           options,
+		cli:               cli,
+		pathCluster:       fmt.Sprintf(formatPathCluster, options.Cluster),
+		pathClusterRoutes: fmt.Sprintf(formatPathClusterRoutes, options.Cluster),
+		pathNodes:         fmt.Sprintf(formatPathNodes, options.Cluster),
+		pathApps:          fmt.Sprintf(formatPathApps, options.Cluster),
+		pathConfig:        fmt.Sprintf(formatPathConfig, options.Cluster),
+		pathGlobalConfig:  formatPathGlobalConfig,
+		config:            make(map[string]any),
 	}, nil
 }
 

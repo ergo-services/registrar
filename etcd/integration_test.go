@@ -160,7 +160,13 @@ func TestIntegrationRegistration(t *testing.T) {
 			{Host: "localhost", Port: 9001, TLS: false},
 		},
 		ApplicationRoutes: []gen.ApplicationRoute{
-			{Node: node.Name(), Name: "test-app", Weight: 50, State: gen.ApplicationStateRunning, Mode: gen.ApplicationModeTransient},
+			{
+				Node:   node.Name(),
+				Name:   "test-app",
+				Weight: 50,
+				State:  gen.ApplicationStateRunning,
+				Mode:   gen.ApplicationModeTransient,
+			},
 		},
 	}
 
@@ -355,11 +361,7 @@ func TestIntegrationConfiguration(t *testing.T) {
 
 	// Put test configuration
 	for key, value := range testConfigs {
-		encoded, err := encode(value) // Use regular encode for storing string values
-		if err != nil {
-			t.Fatalf("Failed to encode config %s: %v", key, err)
-		}
-		_, err = etcdClient.Put(context.Background(), key, encoded)
+		_, err = etcdClient.Put(context.Background(), key, value)
 		if err != nil {
 			t.Fatalf("Failed to put config %s: %v", key, err)
 		}
@@ -738,11 +740,7 @@ func TestIntegrationTypedConfiguration(t *testing.T) {
 
 	// Put test configuration
 	for key, value := range testConfigs {
-		encoded, err := encode(value) // Use regular encode for storing string values
-		if err != nil {
-			t.Fatalf("Failed to encode config %s: %v", key, err)
-		}
-		_, err = etcdClient.Put(context.Background(), key, encoded)
+		_, err = etcdClient.Put(context.Background(), key, value)
 		if err != nil {
 			t.Fatalf("Failed to put config %s: %v", key, err)
 		}
@@ -1221,9 +1219,27 @@ func TestIntegrationEventSystemIntegrity(t *testing.T) {
 
 	// Test 2: Test event system can handle rapid application changes
 	appRoutes := []gen.ApplicationRoute{
-		{Node: mockNodes[0].Name(), Name: "rapid-app-1", Weight: 10, State: gen.ApplicationStateRunning, Mode: gen.ApplicationModeTransient},
-		{Node: mockNodes[1].Name(), Name: "rapid-app-2", Weight: 20, State: gen.ApplicationStateRunning, Mode: gen.ApplicationModeTransient},
-		{Node: mockNodes[2].Name(), Name: "rapid-app-3", Weight: 30, State: gen.ApplicationStateRunning, Mode: gen.ApplicationModeTransient},
+		{
+			Node:   mockNodes[0].Name(),
+			Name:   "rapid-app-1",
+			Weight: 10,
+			State:  gen.ApplicationStateRunning,
+			Mode:   gen.ApplicationModeTransient,
+		},
+		{
+			Node:   mockNodes[1].Name(),
+			Name:   "rapid-app-2",
+			Weight: 20,
+			State:  gen.ApplicationStateRunning,
+			Mode:   gen.ApplicationModeTransient,
+		},
+		{
+			Node:   mockNodes[2].Name(),
+			Name:   "rapid-app-3",
+			Weight: 30,
+			State:  gen.ApplicationStateRunning,
+			Mode:   gen.ApplicationModeTransient,
+		},
 	}
 
 	// Register applications rapidly
@@ -1248,12 +1264,8 @@ func TestIntegrationEventSystemIntegrity(t *testing.T) {
 	// Test 3: Test configuration events with multiple nodes
 	etcdClient := registrars[0].cli
 	globalConfigKey := "services/ergo/config/global/cluster.size"
-	encoded, err := encode("int:3")
-	if err != nil {
-		t.Fatalf("Failed to encode global config: %v", err)
-	}
 
-	_, err = etcdClient.Put(context.Background(), globalConfigKey, encoded)
+	_, err := etcdClient.Put(context.Background(), globalConfigKey, "int:3")
 	if err != nil {
 		t.Fatalf("Failed to put global config: %v", err)
 	}

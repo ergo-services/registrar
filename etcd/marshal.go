@@ -50,22 +50,6 @@ func decodeConfigValue(value any) (any, error) {
 	return str, nil
 }
 
-// decodeConfig decodes configuration values with type prefix support
-func decodeConfig(data []byte) (any, error) {
-	b, err := base64.StdEncoding.DecodeString(string(data))
-	if err != nil {
-		return nil, err
-	}
-
-	value, _, err := edf.Decode(b, edf.Options{})
-	if err != nil {
-		return nil, err
-	}
-
-	// Process for type conversion
-	return decodeConfigValue(value)
-}
-
 // encode encodes general data (routes, application routes, etc.)
 func encode(value any) (string, error) {
 	b := lib.TakeBuffer()
