@@ -16,7 +16,7 @@ Service Discovery and Configuration Management for your cluster.
 
 A `gen.Registrar` implementation for [etcd](https://etcd.io/) 
 
-Doc: https://docs.ergo.services/extra-library/registrars/etcd
+Doc: https://docs.ergo.services/extra-library/registrars/etcd-client
 
 ### saturn
 
@@ -26,5 +26,5 @@ This is a client library for the central registrar [Saturn](https://docs.ergo.se
 
 For commercial or production purposes, it is necessary [to purchase a licence](https://github.com/sponsors/ergo-services).
 
-Doc: https://docs.ergo.services/extra-library/registrars/saturn-slient
+Doc: https://docs.ergo.services/extra-library/registrars/saturn-client
 
