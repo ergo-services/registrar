@@ -1,0 +1,78 @@
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.13
+    container_name: etcd
+    command:
+      - /usr/local/bin/etcd
+      - --name=etcd
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://0.0.0.0:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://0.0.0.0:2380
+      - --initial-cluster=etcd=http://0.0.0.0:2380
+      - --initial-cluster-token=etcd-cluster-token
+      - --initial-cluster-state=new
+      - --log-level=fatal
+      - --log-outputs=stderr
+      - --heartbeat-interval=500
+      - --election-timeout=2500
+    environment:
+      - ETCD_ROOT_PASSWORD=testpass
+      - ETCD_AUTH_TOKEN=simple
+      - ETCDCTL_LOG_LEVEL=error
+    ports:
+      - "12379:2379"
+      - "12380:2380"
+    volumes:
+      - etcd_data:/etcd-data
+      - ./scripts:/scripts
+    networks:
+      - etcd-net
+    healthcheck:
+      test: ["CMD", "etcdctl", "--endpoints=http://localhost:2379", "endpoint", "health"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+  # Authentication setup service
+  auth-setup:
+    image: quay.io/coreos/etcd:v3.5.13
+    container_name: etcd-auth-setup
+    depends_on:
+      etcd:
+        condition: service_healthy
+    volumes:
+      - ./scripts:/scripts
+    networks:
+      - etcd-net
+    command: ["/scripts/setup-auth.sh"]
+    profiles:
+      - auth-enabled
+
+  # Test runner container
+  test-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    container_name: etcd-test-runner
+    depends_on:
+      etcd:
+        condition: service_healthy
+    environment:
+      - ETCD_ENDPOINTS=etcd:2379
+      - GO_TEST_TIMEOUT=30s
+    volumes:
+      - .:/workspace
+    working_dir: /workspace
+    networks:
+      - etcd-net
+    command: ["sleep", "3600"] # Keep container running for manual test execution
+
+volumes:
+  etcd_data:
+
+networks:
+  etcd-net:
+    driver: bridge 

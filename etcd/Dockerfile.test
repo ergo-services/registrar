@@ -1,0 +1,27 @@
+FROM golang:1.21-alpine
+
+# Install git and other necessary tools
+RUN apk add --no-cache git curl bash
+
+# Install etcdctl for debugging and verification
+RUN ETCD_VER=v3.5.13 && \
+    curl -L https://github.com/etcd-io/etcd/releases/download/${ETCD_VER}/etcd-${ETCD_VER}-linux-amd64.tar.gz \
+    -o /tmp/etcd-${ETCD_VER}-linux-amd64.tar.gz && \
+    tar xzf /tmp/etcd-${ETCD_VER}-linux-amd64.tar.gz -C /tmp --strip-components=1 && \
+    mv /tmp/etcdctl /usr/local/bin/ && \
+    rm -rf /tmp/etcd*
+
+# Set working directory
+WORKDIR /workspace
+
+# Copy go mod files first for better layer caching
+COPY go.mod go.sum* ./
+
+# Download dependencies
+RUN go mod download
+
+# Copy source code
+COPY . .
+
+# Default command
+CMD ["go", "test", "-v", "./..."] 
