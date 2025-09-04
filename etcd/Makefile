@@ -23,10 +23,10 @@ TEST_FLAGS := -timeout $(GO_TEST_TIMEOUT)
 # Start etcd container
 start-etcd:
 	@echo "Starting etcd..."
-	@docker-compose up -d
+	@docker compose up -d
 	@echo "Waiting for etcd to be ready..."
 	@for i in {1..30}; do \
-		if docker-compose exec -T etcd etcdctl --endpoints=http://localhost:2379 endpoint health > /dev/null 2>&1; then \
+		if docker compose exec -T etcd etcdctl --endpoints=http://localhost:2379 endpoint health > /dev/null 2>&1; then \
 			echo "etcd is ready!"; \
 			exit 0; \
 		fi; \
@@ -37,7 +37,7 @@ start-etcd:
 # Stop etcd container
 stop-etcd:
 	@echo "Stopping etcd..."
-	@docker-compose down
+	@docker compose down
 
 # Check if etcd is running and accessible
 check-etcd:
@@ -128,17 +128,17 @@ install-tools:
 		tar xzf /tmp/etcd.tar.gz -C /tmp && \
 		sudo mv /tmp/etcd-$${ETCD_VER}-darwin-amd64/etcdctl /usr/local/bin/ && \
 		rm -rf /tmp/etcd*)
-	@command -v docker-compose >/dev/null 2>&1 || (echo "Docker Compose not found. Please install Docker Desktop"; exit 1)
+	@docker compose version >/dev/null 2>&1 || (echo "Docker Compose not found. Please install Docker Desktop"; exit 1)
 	@echo "All tools installed!"
 
 # Show logs
 logs:
-	@docker-compose logs -f etcd
+	@docker compose logs -f etcd
 
 # Show etcd status
 status:
 	@echo "=== Docker Status ==="
-	@docker-compose ps
+	@docker compose ps
 	@echo ""
 	@echo "=== etcd Health ==="
 	@ETCD_ENDPOINTS=$(ETCD_ENDPOINTS) etcdctl --endpoints=$(ETCD_ENDPOINTS) endpoint health || echo "etcd not accessible"
