@@ -7,8 +7,6 @@ Extra library of registrars (service discovery) for the Ergo Framework 3.0 (and 
 
 Service Discovery and Configuration Management for your cluster.
 
-## Available Registrars
-
 ### etcd
 
 [![MIT license](https://img.shields.io/badge/license-MIT-brightgreen.svg)](observer/LICENSE)
