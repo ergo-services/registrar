@@ -159,7 +159,7 @@ func Create(options Options) (gen.Registrar, error) {
 		return nil, fmt.Errorf("failed to create etcd client: %w", err)
 	}
 
-	return &client{
+	client := &client{
 		options:           options,
 		cli:               cli,
 		pathCluster:       fmt.Sprintf(formatPathCluster, options.Cluster),
@@ -169,7 +169,9 @@ func Create(options Options) (gen.Registrar, error) {
 		pathConfig:        fmt.Sprintf(formatPathConfig, options.Cluster),
 		pathGlobalConfig:  formatPathGlobalConfig,
 		config:            make(map[string]any),
-	}, nil
+	}
+
+	return client, nil
 }
 
 // Resolution priority (highest to lowest): 1 -> 2 -> 3 -> 4

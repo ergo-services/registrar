@@ -125,6 +125,10 @@ func (m *mockNode) StopForce() {
 	// Mock force stop
 }
 
+func (m *mockNode) SetEnv(env gen.Env, value any) {
+	// Mock SetEnv implementation
+}
+
 func newMockNode(name string) *mockNode {
 	return &mockNode{
 		name:     gen.Atom(name),
