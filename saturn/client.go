@@ -87,7 +87,7 @@ type client struct {
 	requests sync.Map // ID (uint32) => chan any
 	queue    lib.QueueMPSC
 	// request handler state
-	state int32 // 0 - sleep , 2 - running, 3 - terminated
+	state int32 // 0 - sleep, 1 - running, 2 - terminated
 
 	id uint32
 }
@@ -119,7 +119,7 @@ func (c *client) Resolve(name gen.Atom) ([]gen.Route, error) {
 
 	response, ok := v.(MessageResolveResult)
 	if ok == false {
-		c.node.Log().Error("(saturn) received incorrect resolve result: %#v\n", v)
+		c.node.Log().Error("(saturn) received incorrect resolve result: %#v", v)
 		return nil, gen.ErrMalformed
 	}
 
@@ -170,7 +170,7 @@ func (c *client) ResolveProxy(name gen.Atom) ([]gen.ProxyRoute, error) {
 
 	response, ok := v.(MessageResolveProxyResult)
 	if ok == false {
-		c.node.Log().Error("(saturn) received incorrect resolve proxy result: %#v\n", v)
+		c.node.Log().Error("(saturn) received incorrect resolve proxy result: %#v", v)
 		return nil, gen.ErrMalformed
 	}
 
@@ -339,7 +339,7 @@ func (c *client) Info() gen.RegistrarInfo {
 		Version:                    c.Version(),
 		SupportConfig:              true,
 		SupportEvent:               true,
-		SupportRegisterProxy:       true,
+		SupportRegisterProxy:       false,
 		SupportRegisterApplication: true,
 	}
 }
@@ -367,6 +367,7 @@ func (c *client) Register(node gen.NodeRegistrar, routes gen.RegisterRoutes) (ge
 	c.node.Log().Trace("(saturn) trying to register node on the registrar")
 	static, err := c.tryRegister(conn)
 	if err != nil {
+		conn.Close()
 		return gen.StaticRoutes{}, err
 	}
 
@@ -540,7 +541,7 @@ func (c *client) readMessage(conn net.Conn, timeout time.Duration) (any, error) 
 		}
 
 		if c.chunk[0] != Proto {
-			c.node.Log().Error("(saturn) received malfomed message from the registrar")
+			c.node.Log().Error("(saturn) received malformed message from the registrar")
 			return nil, gen.ErrMalformed
 		}
 		if c.chunk[1] != ProtoVersion {
@@ -581,7 +582,7 @@ func (c *client) serve(conn net.Conn) {
 					// unknown ID (maybe too late)
 					break
 				}
-				c.node.Log().Trace("(saturn) received resolve result: %#v\n", m)
+				c.node.Log().Trace("(saturn) received resolve result: %#v", m)
 				ch := v.(chan any)
 				select {
 				case ch <- m:
@@ -595,7 +596,7 @@ func (c *client) serve(conn net.Conn) {
 					// unknown ID (maybe too late)
 					break
 				}
-				c.node.Log().Trace("(saturn) received resolve proxy result: %#v\n", m)
+				c.node.Log().Trace("(saturn) received resolve proxy result: %#v", m)
 				ch := v.(chan any)
 				select {
 				case ch <- m:
@@ -684,7 +685,7 @@ func (c *client) serve(conn net.Conn) {
 
 				// *:item -> value
 				if strings.HasPrefix(m.Item, "*:") {
-					itemName := strings.TrimPrefix(m.Item, itm)
+					itemName := strings.TrimPrefix(m.Item, "*:")
 					itm1 := fmt.Sprintf("%s:%s:%s", c.cluster, nodename, itemName)
 
 					c.RLock()

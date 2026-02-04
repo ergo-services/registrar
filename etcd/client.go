@@ -52,7 +52,7 @@ const (
 // Resolution priority (highest to lowest): 3 -> 1 -> 2 -> 4
 
 var (
-	defaultEndpoins = []string{"localhost:2379"}
+	defaultEndpoints = []string{"localhost:2379"}
 )
 
 type client struct {
@@ -103,7 +103,7 @@ type Options struct {
 
 func Create(options Options) (gen.Registrar, error) {
 	if len(options.Endpoints) == 0 {
-		options.Endpoints = defaultEndpoins
+		options.Endpoints = defaultEndpoints
 	}
 
 	if options.Cluster == "" {

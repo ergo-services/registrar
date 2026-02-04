@@ -148,6 +148,8 @@ func init() {
 		MessageHandshakeResult{},
 		MessageRegister{},
 		MessageRegisterResult{},
+		MessageRegisterProxy{},
+		MessageUnregisterProxy{},
 		MessageResolve{},
 		MessageResolveResult{},
 		MessageResolveProxy{},
