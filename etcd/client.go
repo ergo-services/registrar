@@ -58,8 +58,9 @@ var (
 type client struct {
 	options Options
 
-	cli   *etcdcli.Client
-	lease etcdcli.LeaseID
+	cli      *etcdcli.Client
+	lease    etcdcli.LeaseID
+	leaseTTL int64 // TTL for etcd lease in seconds
 
 	node gen.NodeRegistrar
 
@@ -99,6 +100,10 @@ type Options struct {
 	DialTimeout    time.Duration
 	RequestTimeout time.Duration
 	KeepAlive      time.Duration
+
+	// LeaseTTL in seconds (default 10)
+	// For testing, can be set to 1-2 seconds to speed up lease expiration
+	LeaseTTL int64
 }
 
 func Create(options Options) (gen.Registrar, error) {
@@ -120,6 +125,10 @@ func Create(options Options) (gen.Registrar, error) {
 
 	if options.KeepAlive == 0 {
 		options.KeepAlive = defaultKeepAlive
+	}
+
+	if options.LeaseTTL == 0 {
+		options.LeaseTTL = 10 // default 10 seconds
 	}
 
 	// Build etcd client configuration
@@ -162,6 +171,7 @@ func Create(options Options) (gen.Registrar, error) {
 	client := &client{
 		options:           options,
 		cli:               cli,
+		leaseTTL:          options.LeaseTTL,
 		pathCluster:       fmt.Sprintf(formatPathCluster, options.Cluster),
 		pathClusterRoutes: fmt.Sprintf(formatPathClusterRoutes, options.Cluster),
 		pathNodes:         fmt.Sprintf(formatPathNodes, options.Cluster),

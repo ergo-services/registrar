@@ -214,62 +214,147 @@ func (c *client) Terminate() {
 // internals
 
 func (c *client) keepRegistration() {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// Main context - cancelled only on Terminate()
+	mainCtx, mainCancel := context.WithCancel(context.Background())
+	defer mainCancel()
 
-	keepAliveCh, err := c.cli.KeepAlive(ctx, c.lease)
-	if err != nil {
-		panic(err)
-	}
+	initialLease := c.lease
 
-	// Single watcher for all events - watch the common path prefix
-	watchCh := c.cli.Watch(ctx, pathPrefix, etcdcli.WithPrefix())
+	for iteration := 0; ; iteration++ {
+		// New context for each iteration - ensures isolation
+		iterCtx, iterCancel := context.WithCancel(mainCtx)
 
-	// Load initial configuration from both sources
-	c.loadConfiguration()
+		var currentLease etcdcli.LeaseID
 
-	for {
-		select {
-		case _, ok := <-keepAliveCh:
-			if ok == false {
-				break
+		if iteration == 0 {
+			// First iteration: use lease from Register()
+			currentLease = initialLease
+			c.node.Log().Info("(registrar) starting with initial lease %d", currentLease)
+		} else {
+			// Reconnection: create new registration
+			c.node.Log().Info("(registrar) attempting to re-register (iteration %d)", iteration)
+
+			oldLease := c.lease
+
+			// Retry loop with exponential backoff
+			for attempt := 1; ; attempt++ {
+				err := c.tryReRegister(oldLease)
+				if err == nil {
+					break // successful reconnection
+				}
+
+				// Check if terminated
+				if atomic.LoadInt32(&c.state) == 2 {
+					c.node.Log().Info("(registrar) terminating during re-register")
+					iterCancel()
+					return
+				}
+
+				c.node.Log().Error("(registrar) re-register attempt %d failed: %v", attempt, err)
+
+				// Exponential backoff with maximum
+				backoff := time.Duration(attempt) * 5 * time.Second
+				if backoff > 30*time.Second {
+					backoff = 30 * time.Second
+				}
+
+				// Interruptible wait instead of sleep
+				c.node.Log().Debug("(registrar) waiting %v before retry", backoff)
+				if !c.waitWithContext(iterCtx, backoff) {
+					// Context cancelled (Terminate called)
+					c.node.Log().Info("(registrar) backoff interrupted, terminating")
+					iterCancel()
+					return
+				}
+
+				oldLease = 0 // Only revoke once
 			}
-			continue
 
-		case watchResp, ok := <-watchCh:
-			if ok == false {
-				break
-			}
+			currentLease = c.lease
+		}
 
-			for _, event := range watchResp.Events {
-				c.handleEvent(event)
+		// Start KeepAlive with iteration context
+		keepAliveCh, err := c.cli.KeepAlive(iterCtx, currentLease)
+		if err != nil {
+			c.node.Log().Error("(registrar) failed to start keepalive: %v", err)
+			iterCancel()
+
+			// Interruptible wait before retry
+			if !c.waitWithContext(mainCtx, 5*time.Second) {
+				return
 			}
 			continue
 		}
 
-		// disconnected, try to reconnect
-		if old := atomic.SwapInt32(&c.state, 0); old == 2 {
+		// Start Watch with iteration context
+		watchCh := c.cli.Watch(iterCtx, pathPrefix, etcdcli.WithPrefix())
+
+		// Load configuration
+		c.loadConfiguration()
+		c.node.Log().Info("(registrar) keepalive active for lease %d", currentLease)
+
+		// Main event loop
+		disconnected := false
+		for !disconnected {
+			select {
+			case resp, ok := <-keepAliveCh:
+				if !ok {
+					c.node.Log().Warning("(registrar) keepalive channel closed")
+					disconnected = true
+					break
+				}
+				if resp != nil {
+					c.node.Log().Trace("(registrar) keepalive response: TTL=%d", resp.TTL)
+				}
+
+			case watchResp, ok := <-watchCh:
+				if !ok {
+					c.node.Log().Warning("(registrar) watch channel closed")
+					disconnected = true
+					break
+				}
+
+				if watchResp.Err() != nil {
+					c.node.Log().Error("(registrar) watch error: %v", watchResp.Err())
+					disconnected = true
+					break
+				}
+
+				for _, event := range watchResp.Events {
+					c.handleEvent(event)
+				}
+			}
+		}
+
+		// CRITICAL: Cancel context to stop keepAlive and watch goroutines
+		c.node.Log().Debug("(registrar) cancelling iteration context")
+		iterCancel()
+
+		// PROPER SYNCHRONIZATION: Wait for channels to close (NO SLEEP!)
+		// The etcd client will close channels when goroutines finish
+		c.node.Log().Debug("(registrar) draining keepalive channel")
+		for range keepAliveCh {
+			// Drain remaining messages - channel will close when goroutine stops
+		}
+
+		c.node.Log().Debug("(registrar) draining watch channel")
+		for range watchCh {
+			// Drain remaining events - channel will close when goroutine stops
+		}
+
+		c.node.Log().Info("(registrar) all goroutines confirmed stopped")
+
+		// Check if client was terminated
+		if atomic.LoadInt32(&c.state) == 2 {
+			c.node.Log().Info("(registrar) client terminated")
 			return
 		}
 
-		for {
-			if _, err := c.tryRegister(); err != nil {
-				c.node.Log().Error("(registrar) failed to re-register: %v", err)
-				time.Sleep(5 * time.Second) // wait before retrying
-				continue
-			}
+		// Reset state to unregistered for re-registration attempt
+		atomic.StoreInt32(&c.state, 0)
 
-			keepAliveCh, err = c.cli.KeepAlive(ctx, c.lease)
-			if err != nil {
-				panic(err)
-			}
-
-			watchCh = c.cli.Watch(ctx, pathPrefix, etcdcli.WithPrefix())
-
-			// Reload configuration after reconnection
-			c.loadConfiguration()
-			break
-		}
+		c.node.Log().Warning("(registrar) will attempt re-registration")
+		// Continue to next iteration
 	}
 }
 
@@ -657,7 +742,7 @@ func (c *client) tryRegister() (gen.StaticRoutes, error) {
 		return noStaticRoutes, gen.ErrRegistrarTerminated
 	}
 
-	leaseResponse, err := c.cli.Grant(context.Background(), 10) // 10 seconds lease
+	leaseResponse, err := c.cli.Grant(context.Background(), c.leaseTTL)
 	if err != nil {
 		return noStaticRoutes, err
 	}
@@ -666,10 +751,13 @@ func (c *client) tryRegister() (gen.StaticRoutes, error) {
 	key := c.pathNodes + string(c.node.Name())
 	value, err := encode(c.routes)
 	if err != nil {
+		// Clean up lease on encode error
+		c.cli.Revoke(context.Background(), c.lease)
+		c.lease = 0
 		return noStaticRoutes, err
 	}
 
-	// register node with routes
+	// register node with routes (protected: only if key doesn't exist)
 	tx := c.cli.Txn(context.Background())
 	txResult, err := tx.
 		If(etcdcli.Compare(etcdcli.CreateRevision(key), "=", 0)).
@@ -677,10 +765,16 @@ func (c *client) tryRegister() (gen.StaticRoutes, error) {
 		Commit()
 
 	if err != nil {
+		// Clean up lease on transaction error
+		c.cli.Revoke(context.Background(), c.lease)
+		c.lease = 0
 		return noStaticRoutes, err
 	}
 
 	if txResult.Succeeded == false {
+		// Clean up lease if key already exists
+		c.cli.Revoke(context.Background(), c.lease)
+		c.lease = 0
 		return noStaticRoutes, gen.ErrTaken
 	}
 
@@ -694,4 +788,118 @@ func (c *client) tryRegister() (gen.StaticRoutes, error) {
 	})
 
 	return noStaticRoutes, nil
+}
+
+// tryReRegister performs re-registration after disconnect
+func (c *client) tryReRegister(oldLease etcdcli.LeaseID) error {
+	if atomic.LoadInt32(&c.state) == 2 {
+		return gen.ErrRegistrarTerminated
+	}
+
+	key := c.pathNodes + string(c.node.Name())
+
+	// Get current key state to check ModRevision
+	getCtx, getCancel := context.WithTimeout(context.Background(), c.options.RequestTimeout)
+	getResp, err := c.cli.Get(getCtx, key)
+	getCancel()
+
+	var currentModRevision int64
+	keyExists := false
+	if err == nil && getResp.Count > 0 {
+		currentModRevision = getResp.Kvs[0].ModRevision
+		keyExists = true
+		c.node.Log().Debug("(registrar) current key exists with ModRevision=%d", currentModRevision)
+	}
+
+	// Revoke old lease (automatically deletes associated keys in etcd)
+	if oldLease != 0 {
+		c.node.Log().Debug("(registrar) revoking old lease %d", oldLease)
+		revokeCtx, revokeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_, err := c.cli.Revoke(revokeCtx, oldLease)
+		revokeCancel()
+
+		if err != nil {
+			c.node.Log().Warning("(registrar) failed to revoke old lease: %v (will expire in 10s)", err)
+			// Not critical - lease will expire on its own
+		}
+	}
+
+	// Create new lease
+	leaseResponse, err := c.cli.Grant(context.Background(), c.leaseTTL)
+	if err != nil {
+		return fmt.Errorf("failed to create new lease: %w", err)
+	}
+	c.lease = leaseResponse.ID
+	c.node.Log().Debug("(registrar) created new lease %d", c.lease)
+
+	value, err := encode(c.routes)
+	if err != nil {
+		c.cli.Revoke(context.Background(), c.lease)
+		c.lease = 0
+		return fmt.Errorf("failed to encode routes: %w", err)
+	}
+
+	// Protected Put with transaction:
+	// - If key didn't exist: create it (ModRevision == 0)
+	// - If key existed with our ModRevision: update it (we're re-registering)
+	// - Otherwise: fail (another node registered)
+	tx := c.cli.Txn(context.Background())
+
+	var txResult *etcdcli.TxnResponse
+	if keyExists {
+		// Key existed - only update if it's still OUR key (same ModRevision)
+		// This prevents overwriting another node's registration
+		txResult, err = tx.
+			If(etcdcli.Compare(etcdcli.ModRevision(key), "=", currentModRevision)).
+			Then(etcdcli.OpPut(key, value, etcdcli.WithLease(c.lease))).
+			Else(etcdcli.OpGet(key)). // Check what happened
+			Commit()
+	} else {
+		// Key didn't exist - create only if it still doesn't exist
+		txResult, err = tx.
+			If(etcdcli.Compare(etcdcli.CreateRevision(key), "=", 0)).
+			Then(etcdcli.OpPut(key, value, etcdcli.WithLease(c.lease))).
+			Else(etcdcli.OpGet(key)). // Check what happened
+			Commit()
+	}
+
+	if err != nil {
+		c.cli.Revoke(context.Background(), c.lease)
+		c.lease = 0
+		return fmt.Errorf("failed to execute transaction: %w", err)
+	}
+
+	if !txResult.Succeeded {
+		// Transaction failed - another node registered this name
+		c.cli.Revoke(context.Background(), c.lease)
+		c.lease = 0
+		c.node.Log().Error("(registrar) key was taken by another node during re-registration")
+		return gen.ErrTaken
+	}
+
+	atomic.StoreInt32(&c.state, 1)
+	c.node.Log().Info("(registrar) successfully re-registered with lease %d", c.lease)
+
+	// Re-register applications
+	c.apps.Range(func(key any, value any) bool {
+		if err := c.RegisterApplicationRoute(value.(gen.ApplicationRoute)); err != nil {
+			c.node.Log().Error("(registrar) unable to register application route: %s", err)
+		}
+		return true
+	})
+
+	return nil
+}
+
+// waitWithContext waits for duration or until context is cancelled
+func (c *client) waitWithContext(ctx context.Context, duration time.Duration) bool {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return true // normal completion
+	case <-ctx.Done():
+		return false // interrupted
+	}
 }
