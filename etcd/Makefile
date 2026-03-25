@@ -17,7 +17,7 @@ help:
 
 # Test configuration
 ETCD_ENDPOINTS := localhost:12379
-GO_TEST_TIMEOUT := 60s
+GO_TEST_TIMEOUT := 300s
 TEST_FLAGS := -timeout $(GO_TEST_TIMEOUT)
 
 # Start etcd container

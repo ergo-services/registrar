@@ -517,8 +517,6 @@ func (c *client) writeMessage(conn net.Conn, message any) error {
 func (c *client) readMessage(conn net.Conn, timeout time.Duration) (any, error) {
 	var b [1024]byte
 
-	buf := append(c.chunk, b[:]...)
-	c.chunk = []byte{}
 	if timeout == 0 {
 		conn.SetReadDeadline(time.Time{})
 	}
@@ -529,12 +527,12 @@ func (c *client) readMessage(conn net.Conn, timeout time.Duration) (any, error) 
 			conn.SetReadDeadline(time.Now().Add(timeout))
 		}
 
-		n, err := conn.Read(buf)
+		n, err := conn.Read(b[:])
 		if err != nil {
 			return nil, err
 		}
 
-		c.chunk = append(c.chunk, buf[:n]...)
+		c.chunk = append(c.chunk, b[:n]...)
 		if len(c.chunk) < 4 {
 			continue
 		}
@@ -742,15 +740,12 @@ func (c *client) serve(conn net.Conn) {
 							continue
 						}
 						c.node.Log().Trace("(saturn) removed application route for %s (remote node %s left the cluster %q)", app, m.Node, c.cluster)
-						routes[0] = routes[i]
-						routes = routes[1:]
-
+						routes = append(routes[:i], routes[i+1:]...)
 						if len(routes) == 0 {
 							delete(c.apps, app)
 						} else {
 							c.apps[app] = routes
 						}
-
 						break
 					}
 				}
@@ -826,16 +821,13 @@ func (c *client) serve(conn net.Conn) {
 					}
 					c.node.Log().Trace("(saturn) remove application route for %s (application stopped on %s )",
 						m.Name, m.Node)
-					routes[0] = routes[i]
-					routes = routes[1:]
+					routes = append(routes[:i], routes[i+1:]...)
 					found = true
-
 					if len(routes) == 0 {
 						delete(c.apps, m.Name)
 					} else {
 						c.apps[m.Name] = routes
 					}
-
 					break
 				}
 				c.Unlock()
@@ -857,10 +849,13 @@ func (c *client) serve(conn net.Conn) {
 
 		if err != io.EOF {
 			if err != gen.ErrMalformed {
-				continue
+				// network error — fall through to reconnect
+				c.conn.Close()
+				c.node.Log().Warning("(saturn) connection error: %s", err)
+			} else {
+				c.conn.Close()
+				c.node.Log().Warning("(saturn) drop connection")
 			}
-			c.conn.Close()
-			c.node.Log().Warning("(saturn) drop connection")
 		} else {
 			// disconnected
 			c.node.Log().Warning("(saturn) lost connection with the registrar, trying to reconnect...")
