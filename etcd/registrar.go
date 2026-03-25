@@ -24,6 +24,10 @@ func (c *client) Register(node gen.NodeRegistrar, routes gen.RegisterRoutes) (ge
 		eventName := gen.Atom(c.pathClusterRoutes)
 		eventRef, err := node.RegisterEvent(eventName, gen.EventOptions{})
 		if err != nil {
+			// Clean up: revoke the lease since keepRegistration won't start
+			c.cli.Revoke(context.Background(), c.lease)
+			c.lease = 0
+			atomic.StoreInt32(&c.state, 0)
 			return gen.StaticRoutes{}, err
 		}
 		c.event = gen.Event{Name: eventName, Node: node.Name()}
@@ -202,10 +206,14 @@ func (c *client) Version() gen.Version {
 
 func (c *client) Terminate() {
 	atomic.StoreInt32(&c.state, 2) // set state to terminated
+	c.cancel()                     // cancel main context - stops KeepAlive immediately
 	if c.lease != 0 {
-		c.cli.Revoke(context.Background(), c.lease) // revoke the lease
+		// Use timeout since main context is already cancelled
+		revokeCtx, revokeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		c.cli.Revoke(revokeCtx, c.lease)
+		revokeCancel()
 	}
-	c.cli.Close() // close the client connection
+	c.cli.Close()
 	if c.node != nil {
 		c.node.Log().Trace("(etcd) registrar client terminated")
 	}
@@ -214,15 +222,11 @@ func (c *client) Terminate() {
 // internals
 
 func (c *client) keepRegistration() {
-	// Main context - cancelled only on Terminate()
-	mainCtx, mainCancel := context.WithCancel(context.Background())
-	defer mainCancel()
-
 	initialLease := c.lease
 
 	for iteration := 0; ; iteration++ {
-		// New context for each iteration - ensures isolation
-		iterCtx, iterCancel := context.WithCancel(mainCtx)
+		// New context for each iteration - derives from c.ctx (cancelled by Terminate)
+		iterCtx, iterCancel := context.WithCancel(c.ctx)
 
 		var currentLease etcdcli.LeaseID
 
@@ -267,7 +271,6 @@ func (c *client) keepRegistration() {
 					return
 				}
 
-				oldLease = 0 // Only revoke once
 			}
 
 			currentLease = c.lease
@@ -280,7 +283,7 @@ func (c *client) keepRegistration() {
 			iterCancel()
 
 			// Interruptible wait before retry
-			if !c.waitWithContext(mainCtx, 5*time.Second) {
+			if !c.waitWithContext(c.ctx, 5*time.Second) {
 				return
 			}
 			continue
@@ -790,7 +793,11 @@ func (c *client) tryRegister() (gen.StaticRoutes, error) {
 	return noStaticRoutes, nil
 }
 
-// tryReRegister performs re-registration after disconnect
+// tryReRegister performs re-registration after disconnect.
+// Creates a new lease FIRST, then attempts to register using two strategies:
+// 1. Key doesn't exist (old lease expired) - create it
+// 2. Key exists with our old lease (reconnected before expiry) - replace lease
+// Old lease is revoked only AFTER successful re-registration.
 func (c *client) tryReRegister(oldLease etcdcli.LeaseID) error {
 	if atomic.LoadInt32(&c.state) == 2 {
 		return gen.ErrRegistrarTerminated
@@ -798,91 +805,64 @@ func (c *client) tryReRegister(oldLease etcdcli.LeaseID) error {
 
 	key := c.pathNodes + string(c.node.Name())
 
-	// Get current key state to check ModRevision
-	getCtx, getCancel := context.WithTimeout(context.Background(), c.options.RequestTimeout)
-	getResp, err := c.cli.Get(getCtx, key)
-	getCancel()
-
-	var currentModRevision int64
-	keyExists := false
-	if err == nil && getResp.Count > 0 {
-		currentModRevision = getResp.Kvs[0].ModRevision
-		keyExists = true
-		c.node.Log().Debug("(registrar) current key exists with ModRevision=%d", currentModRevision)
-	}
-
-	// Revoke old lease (automatically deletes associated keys in etcd)
-	if oldLease != 0 {
-		c.node.Log().Debug("(registrar) revoking old lease %d", oldLease)
-		revokeCtx, revokeCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		_, err := c.cli.Revoke(revokeCtx, oldLease)
-		revokeCancel()
-
-		if err != nil {
-			c.node.Log().Warning("(registrar) failed to revoke old lease: %v (will expire in 10s)", err)
-			// Not critical - lease will expire on its own
-		}
-	}
-
-	// Create new lease
+	// Create new lease first (before touching old one)
 	leaseResponse, err := c.cli.Grant(context.Background(), c.leaseTTL)
 	if err != nil {
 		return fmt.Errorf("failed to create new lease: %w", err)
 	}
-	c.lease = leaseResponse.ID
-	c.node.Log().Debug("(registrar) created new lease %d", c.lease)
+	newLease := leaseResponse.ID
+	c.node.Log().Debug("(registrar) created new lease %d", newLease)
 
 	value, err := encode(c.routes)
 	if err != nil {
-		c.cli.Revoke(context.Background(), c.lease)
-		c.lease = 0
+		c.cli.Revoke(context.Background(), newLease)
 		return fmt.Errorf("failed to encode routes: %w", err)
 	}
 
-	// Protected Put with transaction:
-	// - If key didn't exist: create it (ModRevision == 0)
-	// - If key existed with our ModRevision: update it (we're re-registering)
-	// - Otherwise: fail (another node registered)
-	tx := c.cli.Txn(context.Background())
-
-	var txResult *etcdcli.TxnResponse
-	if keyExists {
-		// Key existed - only update if it's still OUR key (same ModRevision)
-		// This prevents overwriting another node's registration
-		txResult, err = tx.
-			If(etcdcli.Compare(etcdcli.ModRevision(key), "=", currentModRevision)).
-			Then(etcdcli.OpPut(key, value, etcdcli.WithLease(c.lease))).
-			Else(etcdcli.OpGet(key)). // Check what happened
-			Commit()
-	} else {
-		// Key didn't exist - create only if it still doesn't exist
-		txResult, err = tx.
-			If(etcdcli.Compare(etcdcli.CreateRevision(key), "=", 0)).
-			Then(etcdcli.OpPut(key, value, etcdcli.WithLease(c.lease))).
-			Else(etcdcli.OpGet(key)). // Check what happened
-			Commit()
-	}
-
+	// Attempt 1: key doesn't exist (old lease expired, key was deleted)
+	txResult, err := c.cli.Txn(context.Background()).
+		If(etcdcli.Compare(etcdcli.CreateRevision(key), "=", 0)).
+		Then(etcdcli.OpPut(key, value, etcdcli.WithLease(newLease))).
+		Commit()
 	if err != nil {
-		c.cli.Revoke(context.Background(), c.lease)
-		c.lease = 0
+		c.cli.Revoke(context.Background(), newLease)
 		return fmt.Errorf("failed to execute transaction: %w", err)
 	}
 
-	if !txResult.Succeeded {
-		// Transaction failed - another node registered this name
-		c.cli.Revoke(context.Background(), c.lease)
-		c.lease = 0
+	// Attempt 2: key exists with our old lease (reconnected before expiry)
+	if txResult.Succeeded == false && oldLease != 0 {
+		txResult, err = c.cli.Txn(context.Background()).
+			If(etcdcli.Compare(etcdcli.LeaseValue(key), "=", int64(oldLease))).
+			Then(etcdcli.OpPut(key, value, etcdcli.WithLease(newLease))).
+			Commit()
+		if err != nil {
+			c.cli.Revoke(context.Background(), newLease)
+			return fmt.Errorf("failed to execute transaction: %w", err)
+		}
+	}
+
+	if txResult.Succeeded == false {
+		// Both attempts failed - another node registered this name
+		c.cli.Revoke(context.Background(), newLease)
 		c.node.Log().Error("(registrar) key was taken by another node during re-registration")
 		return gen.ErrTaken
 	}
 
+	// Success
+	c.lease = newLease
 	atomic.StoreInt32(&c.state, 1)
 	c.node.Log().Info("(registrar) successfully re-registered with lease %d", c.lease)
 
+	// Revoke old lease (best effort, no keys attached anymore)
+	if oldLease != 0 {
+		revokeCtx, revokeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		c.cli.Revoke(revokeCtx, oldLease)
+		revokeCancel()
+	}
+
 	// Re-register applications
-	c.apps.Range(func(key any, value any) bool {
-		if err := c.RegisterApplicationRoute(value.(gen.ApplicationRoute)); err != nil {
+	c.apps.Range(func(k any, v any) bool {
+		if err := c.RegisterApplicationRoute(v.(gen.ApplicationRoute)); err != nil {
 			c.node.Log().Error("(registrar) unable to register application route: %s", err)
 		}
 		return true

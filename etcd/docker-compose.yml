@@ -1,7 +1,7 @@
 services:
   etcd:
     image: quay.io/coreos/etcd:v3.5.13
-    container_name: etcd
+    container_name: etcd-registrar-test
     command:
       - /usr/local/bin/etcd
       - --name=etcd
@@ -15,8 +15,8 @@ services:
       - --initial-cluster-state=new
       - --log-level=fatal
       - --log-outputs=stderr
-      - --heartbeat-interval=500
-      - --election-timeout=2500
+      - --heartbeat-interval=100
+      - --election-timeout=1000
     environment:
       - ETCD_ROOT_PASSWORD=testpass
       - ETCD_AUTH_TOKEN=simple

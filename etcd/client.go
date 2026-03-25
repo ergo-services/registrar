@@ -1,6 +1,7 @@
 package etcd
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"sync"
@@ -64,6 +65,9 @@ type client struct {
 
 	node gen.NodeRegistrar
 
+	ctx    context.Context
+	cancel context.CancelFunc
+
 	pathCluster       string
 	pathClusterRoutes string // Non-overlapping with config - uses edf.Encode + base64
 	pathNodes         string
@@ -123,12 +127,18 @@ func Create(options Options) (gen.Registrar, error) {
 		options.RequestTimeout = defaultRequestTimeout
 	}
 
-	if options.KeepAlive == 0 {
-		options.KeepAlive = defaultKeepAlive
-	}
-
 	if options.LeaseTTL == 0 {
 		options.LeaseTTL = 10 // default 10 seconds
+	}
+
+	if options.KeepAlive == 0 {
+		// Derive from LeaseTTL for fast dead connection detection.
+		// Detection time = DialKeepAliveTime + DialKeepAliveTimeout = 2 * KeepAlive.
+		// Must be less than LeaseTTL to allow endpoint failover before lease expires.
+		options.KeepAlive = time.Duration(options.LeaseTTL) * time.Second / 3
+		if options.KeepAlive < time.Second {
+			options.KeepAlive = time.Second
+		}
 	}
 
 	// Build etcd client configuration
@@ -168,10 +178,14 @@ func Create(options Options) (gen.Registrar, error) {
 		return nil, fmt.Errorf("failed to create etcd client: %w", err)
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+
 	client := &client{
 		options:           options,
 		cli:               cli,
 		leaseTTL:          options.LeaseTTL,
+		ctx:               ctx,
+		cancel:            cancel,
 		pathCluster:       fmt.Sprintf(formatPathCluster, options.Cluster),
 		pathClusterRoutes: fmt.Sprintf(formatPathClusterRoutes, options.Cluster),
 		pathNodes:         fmt.Sprintf(formatPathNodes, options.Cluster),
