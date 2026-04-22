@@ -289,6 +289,15 @@ func (c *client) keepRegistration() {
 			continue
 		}
 
+		// Drop lazy app-route cache before starting the new Watch.
+		// During disconnect we lost events, so cached entries may be stale.
+		// Clearing here (before Watch starts) avoids a window where the new
+		// watcher feeds events into stale entries that we would only clear
+		// afterwards. Next ResolveApplication calls will re-fetch on miss.
+		c.appCacheLock.Lock()
+		c.appCache = make(map[gen.Atom]*appEntry)
+		c.appCacheLock.Unlock()
+
 		// Start Watch with iteration context
 		watchCh := c.cli.Watch(iterCtx, pathPrefix, etcdcli.WithPrefix())
 
@@ -688,10 +697,14 @@ func (c *client) handleApplicationEvent(event *etcdcli.Event) {
 		}
 
 		appRoute, ok := route.(gen.ApplicationRoute)
-		if !ok {
+		if ok == false {
 			c.node.Log().Error("(registrar) invalid application route type: %T", route)
 			return
 		}
+
+		// Update cache before emitting the framework event so receivers
+		// that call ResolveApplication see the fresh state.
+		c.updateAppCachePut(appName, nodeName, appRoute, event.Kv.ModRevision)
 
 		// Send appropriate event based on application state
 		switch appRoute.State {
@@ -727,6 +740,9 @@ func (c *client) handleApplicationEvent(event *etcdcli.Event) {
 		}
 
 	case etcdcli.EventTypeDelete:
+		// Update cache before emitting the framework event.
+		c.updateAppCacheDelete(appName, nodeName, event.Kv.ModRevision)
+
 		// Application stopped/unloaded
 		ev := EventApplicationStopped{
 			Name: appName,
@@ -736,6 +752,43 @@ func (c *client) handleApplicationEvent(event *etcdcli.Event) {
 			c.node.Log().Error("(registrar) failed to send application stopped event: %v", err)
 		}
 	}
+}
+
+// updateAppCachePut applies a PUT watch event to the app cache if it's newer
+// than the entry's stored revision. Entries with no prior resolve are ignored
+// (a future ResolveApplication will fetch fresh state on miss).
+func (c *client) updateAppCachePut(appName, nodeName gen.Atom, route gen.ApplicationRoute, rev int64) {
+	c.appCacheLock.Lock()
+	defer c.appCacheLock.Unlock()
+
+	entry, ok := c.appCache[appName]
+	if ok == false {
+		return
+	}
+	if rev <= entry.rev {
+		return
+	}
+	if entry.routes == nil {
+		entry.routes = make(map[gen.Atom]gen.ApplicationRoute)
+	}
+	entry.routes[nodeName] = route
+	entry.rev = rev
+}
+
+// updateAppCacheDelete applies a DELETE watch event to the app cache.
+func (c *client) updateAppCacheDelete(appName, nodeName gen.Atom, rev int64) {
+	c.appCacheLock.Lock()
+	defer c.appCacheLock.Unlock()
+
+	entry, ok := c.appCache[appName]
+	if ok == false {
+		return
+	}
+	if rev <= entry.rev {
+		return
+	}
+	delete(entry.routes, nodeName)
+	entry.rev = rev
 }
 
 func (c *client) tryRegister() (gen.StaticRoutes, error) {

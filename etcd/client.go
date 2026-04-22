@@ -56,6 +56,15 @@ var (
 	defaultEndpoins = []string{"localhost:2379"}
 )
 
+// appEntry is a cache entry for ResolveApplication results.
+// rev is the etcd revision at which routes were last known to be accurate:
+// either Header.Revision from the Get that populated the entry, or
+// Kv.ModRevision from a Watch event that updated it.
+type appEntry struct {
+	routes map[gen.Atom]gen.ApplicationRoute // keyed by node name
+	rev    int64
+}
+
 type client struct {
 	options Options
 
@@ -79,7 +88,10 @@ type client struct {
 
 	config     map[string]any
 	configLock sync.RWMutex
-	apps       sync.Map // map[gen.Atom]gen.ApplicationRoute
+	apps       sync.Map // map[gen.Atom]gen.ApplicationRoute — local apps, kept for re-registration
+
+	appCache     map[gen.Atom]*appEntry // lazy cache for ResolveApplication, updated by Watch
+	appCacheLock sync.RWMutex
 
 	event    gen.Event
 	eventRef gen.Ref
@@ -193,6 +205,7 @@ func Create(options Options) (gen.Registrar, error) {
 		pathConfig:        fmt.Sprintf(formatPathConfig, options.Cluster),
 		pathGlobalConfig:  formatPathGlobalConfig,
 		config:            make(map[string]any),
+		appCache:          make(map[gen.Atom]*appEntry),
 	}
 
 	return client, nil
