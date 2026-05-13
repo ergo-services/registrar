@@ -63,6 +63,16 @@ var (
 type appEntry struct {
 	routes map[gen.Atom]gen.ApplicationRoute // keyed by node name
 	rev    int64
+
+	// rrGen is bumped under appCacheLock whenever routes is mutated.
+	// rrState/rrSeen are protected by rrLock and rebuilt lazily when
+	// rrSeen != observed rrGen. Separating rrLock from appCacheLock keeps
+	// the read-mostly cache path free of write-lock contention during
+	// the smooth-WRR step that mutates rotation state.
+	rrGen   uint64
+	rrLock  sync.Mutex
+	rrSeen  uint64
+	rrState map[gen.Atom]int // smooth-WRR current_weight
 }
 
 type client struct {

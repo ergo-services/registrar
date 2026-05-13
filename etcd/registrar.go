@@ -773,6 +773,7 @@ func (c *client) updateAppCachePut(appName, nodeName gen.Atom, route gen.Applica
 	}
 	entry.routes[nodeName] = route
 	entry.rev = rev
+	entry.rrGen++
 }
 
 // updateAppCacheDelete applies a DELETE watch event to the app cache.
@@ -789,6 +790,7 @@ func (c *client) updateAppCacheDelete(appName, nodeName gen.Atom, rev int64) {
 	}
 	delete(entry.routes, nodeName)
 	entry.rev = rev
+	entry.rrGen++
 }
 
 func (c *client) tryRegister() (gen.StaticRoutes, error) {

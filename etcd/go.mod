@@ -3,7 +3,7 @@ module ergo.services/registrar/etcd
 go 1.25.0
 
 require (
-	ergo.services/ergo v1.999.320
+	ergo.services/ergo v1.999.321-0.20260512224028-1517f213feec
 	go.etcd.io/etcd/client/v3 v3.5.28
 	go.uber.org/zap v1.26.0
 )
