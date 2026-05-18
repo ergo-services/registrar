@@ -1,7 +1,5 @@
-ergo.services/ergo v1.999.320 h1:IYyjCBJvXPLW8Mpy6pq5FoBa2RjNAS4QSL2lK7bBueQ=
-ergo.services/ergo v1.999.320/go.mod h1:bLQ6PoO6Mz/8gVuzvPv3xfMfo1P9w6rZV1WnMXMeMdg=
-ergo.services/ergo v1.999.321-0.20260512224028-1517f213feec h1:wbSKtm7slIRmAI8Ajtbrf2vKKbtx+yGKYrXTMuB1PsY=
-ergo.services/ergo v1.999.321-0.20260512224028-1517f213feec/go.mod h1:2WcCdXUIZvCfy9Kkac3Sx6V/tB23Mx3yK6xz77hRfbM=
+ergo.services/ergo v1.999.321-0.20260518141628-c18fb8833b5a h1:tNiE+nQA7Yl3wQVIZ/u+9nTjlK70NqD+1R6xrQzrbpc=
+ergo.services/ergo v1.999.321-0.20260518141628-c18fb8833b5a/go.mod h1:2WcCdXUIZvCfy9Kkac3Sx6V/tB23Mx3yK6xz77hRfbM=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
 github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
 github.com/coreos/go-semver v0.3.1 h1:yi21YpKnrx1gt5R+la8n5WgS0kCrsPp33dmEyHReZr4=

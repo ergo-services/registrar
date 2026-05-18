@@ -130,7 +130,7 @@ func (c *client) Resolve(name gen.Atom) ([]gen.Route, error) {
 	return response.Routes, nil
 }
 
-func (c *client) ResolveApplication(name gen.Atom) ([]gen.ApplicationRoute, error) {
+func (c *client) ResolveApplication(name gen.Atom) (gen.ApplicationRoutes, error) {
 	if c.isHandlerTerminated() {
 		return nil, gen.ErrRegistrarTerminated
 	}
@@ -139,7 +139,7 @@ func (c *client) ResolveApplication(name gen.Atom) ([]gen.ApplicationRoute, erro
 	defer c.RUnlock()
 
 	if ar, found := c.apps[name]; found {
-		arcopy := make([]gen.ApplicationRoute, len(ar))
+		arcopy := make(gen.ApplicationRoutes, len(ar))
 		copy(arcopy, ar)
 		return arcopy, nil
 	}
