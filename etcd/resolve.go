@@ -129,6 +129,9 @@ func (c *client) ResolveApplication(name gen.Atom) (gen.ApplicationRoutes, error
 func snapshotAppRoutes(entry *appEntry) []gen.ApplicationRoute {
 	out := make([]gen.ApplicationRoute, 0, len(entry.routes))
 	for _, r := range entry.routes {
+		if r.Weight < 0 {
+			continue // negative weight opts the route out of resolve results
+		}
 		out = append(out, r)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Node < out[j].Node })

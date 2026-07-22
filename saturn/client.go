@@ -139,8 +139,16 @@ func (c *client) ResolveApplication(name gen.Atom) (gen.ApplicationRoutes, error
 	defer c.RUnlock()
 
 	if ar, found := c.apps[name]; found {
-		arcopy := make(gen.ApplicationRoutes, len(ar))
-		copy(arcopy, ar)
+		arcopy := make(gen.ApplicationRoutes, 0, len(ar))
+		for _, r := range ar {
+			if r.Weight < 0 {
+				continue // negative weight opts the route out of resolve results
+			}
+			arcopy = append(arcopy, r)
+		}
+		if len(arcopy) == 0 {
+			return nil, gen.ErrNoRoute
+		}
 		return arcopy, nil
 	}
 
