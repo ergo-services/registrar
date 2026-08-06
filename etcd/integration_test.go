@@ -8,135 +8,8 @@ import (
 	"time"
 
 	"ergo.services/ergo/gen"
+	"ergo.services/ergo/testing/mock"
 )
-
-// Mock node implementation for testing
-type mockNode struct {
-	name     gen.Atom
-	creation int64
-	events   map[gen.Atom]gen.Ref
-	logger   *mockLog
-}
-
-type mockLog struct {
-	messages []string
-	level    gen.LogLevel
-	fields   []gen.LogField
-}
-
-func (l *mockLog) Level() gen.LogLevel {
-	return l.level
-}
-
-func (l *mockLog) SetLevel(level gen.LogLevel) error {
-	l.level = level
-	return nil
-}
-
-func (l *mockLog) Logger() string {
-	return "mock"
-}
-
-func (l *mockLog) SetLogger(name string) {
-	// Mock implementation
-}
-
-func (l *mockLog) Fields() []gen.LogField {
-	return l.fields
-}
-
-func (l *mockLog) AddFields(fields ...gen.LogField) {
-	l.fields = append(l.fields, fields...)
-}
-
-func (l *mockLog) DeleteFields(fields ...string) {
-	// Mock implementation
-}
-
-func (l *mockLog) PushFields() int {
-	return len(l.fields)
-}
-
-func (l *mockLog) PopFields() int {
-	return len(l.fields)
-}
-
-func (l *mockLog) Trace(format string, args ...any) {
-	l.messages = append(l.messages, "TRACE: "+format)
-}
-
-func (l *mockLog) Debug(format string, args ...any) {
-	l.messages = append(l.messages, "DEBUG: "+format)
-}
-
-func (l *mockLog) Info(format string, args ...any) {
-	l.messages = append(l.messages, "INFO: "+format)
-}
-
-func (l *mockLog) Warning(format string, args ...any) {
-	l.messages = append(l.messages, "WARNING: "+format)
-}
-
-func (l *mockLog) Error(format string, args ...any) {
-	l.messages = append(l.messages, "ERROR: "+format)
-}
-
-func (l *mockLog) Panic(format string, args ...any) {
-	l.messages = append(l.messages, "PANIC: "+format)
-}
-
-func (m *mockNode) Name() gen.Atom {
-	return m.name
-}
-
-func (m *mockNode) Creation() int64 {
-	return m.creation
-}
-
-func (m *mockNode) Log() gen.Log {
-	return m.logger
-}
-
-func (m *mockNode) RegisterEvent(name gen.Atom, options gen.EventOptions) (gen.Ref, error) {
-	ref := gen.Ref{
-		Node:     m.name,
-		Creation: m.creation,
-		ID:       [3]uint64{123, 456, 789}, // Mock ref ID
-	}
-	m.events[name] = ref
-	return ref, nil
-}
-
-func (m *mockNode) UnregisterEvent(name gen.Atom) error {
-	delete(m.events, name)
-	return nil
-}
-
-func (m *mockNode) SendEvent(name gen.Atom, token gen.Ref, options gen.MessageOptions, event any) error {
-	// Mock event sending - just store for verification
-	return nil
-}
-
-func (m *mockNode) Stop() {
-	// Mock stop
-}
-
-func (m *mockNode) StopForce() {
-	// Mock force stop
-}
-
-func (m *mockNode) SetEnv(env gen.Env, value any) {
-	// Mock SetEnv implementation
-}
-
-func newMockNode(name string) *mockNode {
-	return &mockNode{
-		name:     gen.Atom(name),
-		creation: time.Now().Unix(),
-		events:   make(map[gen.Atom]gen.Ref),
-		logger:   &mockLog{level: gen.LogLevelInfo},
-	}
-}
 
 // TestIntegrationRegistration tests the full registration flow
 func TestIntegrationRegistration(t *testing.T) {
@@ -156,7 +29,7 @@ func TestIntegrationRegistration(t *testing.T) {
 	defer registrar.Terminate()
 
 	client := registrar.(*client)
-	node := newMockNode("test-node")
+	node := newMockNode(t, "test-node")
 
 	// Test registration
 	routes := gen.RegisterRoutes{
@@ -243,8 +116,8 @@ func TestIntegrationNodes(t *testing.T) {
 	client1 := registrar1.(*client)
 	client2 := registrar2.(*client)
 
-	node1 := newMockNode("node1")
-	node2 := newMockNode("node2")
+	node1 := newMockNode(t, "node1")
+	node2 := newMockNode(t, "node2")
 
 	routes := gen.RegisterRoutes{
 		Routes: []gen.Route{{Host: "localhost", Port: 9001, TLS: false}},
@@ -302,7 +175,7 @@ func TestIntegrationApplicationRoutes(t *testing.T) {
 	defer registrar.Terminate()
 
 	client := registrar.(*client)
-	node := newMockNode("test-node")
+	node := newMockNode(t, "test-node")
 
 	routes := gen.RegisterRoutes{
 		Routes: []gen.Route{{Host: "localhost", Port: 9001, TLS: false}},
@@ -389,7 +262,7 @@ func TestIntegrationConfiguration(t *testing.T) {
 	defer registrar.Terminate()
 
 	client := registrar.(*client)
-	node := newMockNode("test-node")
+	node := newMockNode(t, "test-node")
 
 	routes := gen.RegisterRoutes{
 		Routes: []gen.Route{{Host: "localhost", Port: 9001, TLS: false}},
@@ -502,7 +375,7 @@ func TestIntegrationTerminatedState(t *testing.T) {
 	}
 
 	client := registrar.(*client)
-	node := newMockNode("test-node")
+	node := newMockNode(t, "test-node")
 
 	routes := gen.RegisterRoutes{
 		Routes: []gen.Route{{Host: "localhost", Port: 9001, TLS: false}},
@@ -592,8 +465,8 @@ func TestIntegrationErrorConditions(t *testing.T) {
 		client1 := registrar1.(*client)
 		client2 := registrar2.(*client)
 
-		node1 := newMockNode("same-node")
-		node2 := newMockNode("same-node")
+		node1 := newMockNode(t, "same-node")
+		node2 := newMockNode(t, "same-node")
 
 		routes := gen.RegisterRoutes{
 			Routes: []gen.Route{{Host: "localhost", Port: 9001, TLS: false}},
@@ -768,7 +641,7 @@ func TestIntegrationTypedConfiguration(t *testing.T) {
 	defer registrar.Terminate()
 
 	client := registrar.(*client)
-	node := newMockNode("test-node")
+	node := newMockNode(t, "test-node")
 
 	routes := gen.RegisterRoutes{
 		Routes: []gen.Route{{Host: "localhost", Port: 9001, TLS: false}},
@@ -861,162 +734,76 @@ func TestIntegrationTypedConfiguration(t *testing.T) {
 	}
 }
 
-// Event testing infrastructure
-
-// mockEventReceiver helps capture events sent during tests
-type mockEventReceiver struct {
-	node     *mockNode
-	events   []any
-	eventRef gen.Ref
-}
-
-func newMockEventReceiver(name string, registrar gen.Registrar) (*mockEventReceiver, error) {
-	receiver := &mockEventReceiver{
-		node:   newMockNode(name),
-		events: make([]any, 0),
-	}
-
-	// Get the event from registrar to monitor
-	event, err := registrar.Event()
-	if err != nil {
-		return nil, err
-	}
-
-	// Register an event to receive notifications (simulating LinkEvent)
-	ref, err := receiver.node.RegisterEvent(event.Name, gen.EventOptions{})
-	if err != nil {
-		return nil, err
-	}
-	receiver.eventRef = ref
-
-	return receiver, nil
-}
-
-func (r *mockEventReceiver) sendTestEvent(event any) error {
-	return r.node.SendEvent(gen.Atom("test-cluster"), r.eventRef, gen.MessageOptions{}, event)
-}
-
-func (r *mockEventReceiver) getEvents() []any {
-	return r.events
-}
-
-func (r *mockEventReceiver) clearEvents() {
-	r.events = make([]any, 0)
-}
-
-// TestIntegrationNodeEvents tests node join/leave events
+// TestIntegrationNodeEvents asserts the join/leave events an observing registrar
+// publishes when another node appears in the cluster and then goes away.
 func TestIntegrationNodeEvents(t *testing.T) {
 	endpoints := getTestEndpoints()
 	if endpoints == nil {
 		t.Skip("Skipping integration test - no ETCD_ENDPOINTS set")
 	}
 
-	// Create event receiver
-	registrar1, err := Create(Options{
-		Endpoints: endpoints,
-		Cluster:   "event-test-cluster",
-	})
-	if err != nil {
-		t.Fatalf("Failed to create registrar1: %v", err)
-	}
-	defer registrar1.Terminate()
+	options := Options{Endpoints: endpoints, Cluster: "event-test-cluster"}
 
-	receiver, err := newMockEventReceiver("event-receiver", registrar1)
-	if err != nil {
-		t.Fatalf("Failed to create event receiver: %v", err)
-	}
+	observer, observerNode := registerNode(t, options, "event-observer")
+	eventName := gen.Atom(observer.pathClusterRoutes)
 
-	client1 := registrar1.(*client)
+	// keepRegistration establishes the watch right after Register returns. Give
+	// it a moment so the join below is not missed.
+	time.Sleep(300 * time.Millisecond)
 
-	// Register first node to establish event monitoring
-	_, err = client1.Register(receiver.node, gen.RegisterRoutes{
-		Routes: []gen.Route{{Host: "localhost", Port: 9001, TLS: false}},
-	})
-	if err != nil {
-		t.Fatalf("Failed to register receiver node: %v", err)
-	}
+	joining, joiningNode := registerNode(t, options, "joining-node")
 
-	// Give time for event setup
-	time.Sleep(100 * time.Millisecond)
+	observerNode.ShouldSendEvent().
+		Name(eventName).
+		Where(eventMessage(EventNodeJoined{Name: joiningNode.Name()})).
+		Within(5 * time.Second).
+		AtLeast(1).
+		Assert()
 
-	// Test EventNodeJoined: Create second registrar (simulates node joining)
-	registrar2, err := Create(Options{
-		Endpoints: endpoints,
-		Cluster:   "event-test-cluster",
-	})
-	if err != nil {
-		t.Fatalf("Failed to create registrar2: %v", err)
-	}
-	defer registrar2.Terminate()
+	// a registrar never reports its own node
+	observerNode.ShouldSendEvent().
+		Where(eventMessage(EventNodeJoined{Name: observerNode.Name()})).
+		None().
+		Assert()
 
-	client2 := registrar2.(*client)
-	node2 := newMockNode("joining-node")
+	joining.Terminate() // revokes the lease, etcd drops the node key
 
-	_, err = client2.Register(node2, gen.RegisterRoutes{
-		Routes: []gen.Route{{Host: "localhost", Port: 9002, TLS: false}},
-	})
-	if err != nil {
-		t.Fatalf("Failed to register joining node: %v", err)
-	}
+	observerNode.ShouldSendEvent().
+		Name(eventName).
+		Where(eventMessage(EventNodeLeft{Name: joiningNode.Name()})).
+		Within(5 * time.Second).
+		AtLeast(1).
+		Assert()
 
-	// Give time for event propagation
-	time.Sleep(200 * time.Millisecond)
-
-	// Verify EventNodeJoined was sent
-	// Note: In a real scenario, we'd need to set up proper event monitoring
-	// For now, we'll verify the registrar can handle events by checking internal state
-
-	// Test EventNodeLeft: Terminate second registrar (simulates node leaving)
-	client2.Terminate()
-
-	// Give time for lease expiration and event propagation
-	time.Sleep(200 * time.Millisecond)
-
-	// Verify nodes list is updated
-	nodes, err := client1.Nodes()
+	nodes, err := observer.Nodes()
 	if err != nil {
 		t.Fatalf("Failed to get nodes list: %v", err)
 	}
-
-	// Should not see the left node
 	for _, node := range nodes {
-		if node == node2.Name() {
+		if node == joiningNode.Name() {
 			t.Error("Expected left node to not be in nodes list")
 		}
 	}
 }
 
-// TestIntegrationApplicationEvents tests application lifecycle events
+// TestIntegrationApplicationEvents asserts that every application state maps to
+// the matching lifecycle event, and that removing a route reports it stopped.
 func TestIntegrationApplicationEvents(t *testing.T) {
 	endpoints := getTestEndpoints()
 	if endpoints == nil {
 		t.Skip("Skipping integration test - no ETCD_ENDPOINTS set")
 	}
 
-	// Create registrar and register node
-	registrar, err := Create(Options{
-		Endpoints: endpoints,
-		Cluster:   "app-event-test-cluster",
-	})
-	if err != nil {
-		t.Fatalf("Failed to create registrar: %v", err)
-	}
-	defer registrar.Terminate()
+	options := Options{Endpoints: endpoints, Cluster: "app-event-test-cluster"}
+	client, node := registerNode(t, options, "app-test-node")
+	eventName := gen.Atom(client.pathClusterRoutes)
 
-	client := registrar.(*client)
-	node := newMockNode("app-test-node")
+	time.Sleep(300 * time.Millisecond) // let the watch come up
 
-	_, err = client.Register(node, gen.RegisterRoutes{
-		Routes: []gen.Route{{Host: "localhost", Port: 9001, TLS: false}},
-	})
-	if err != nil {
-		t.Fatalf("Failed to register node: %v", err)
-	}
-
-	// Test EventApplicationStarted: Register an application route
 	testCases := []struct {
-		route gen.ApplicationRoute
-		desc  string
+		route   gen.ApplicationRoute
+		started any
+		desc    string
 	}{
 		{
 			route: gen.ApplicationRoute{
@@ -1026,7 +813,8 @@ func TestIntegrationApplicationEvents(t *testing.T) {
 				State:  gen.ApplicationStateLoaded,
 				Mode:   gen.ApplicationModeTransient,
 			},
-			desc: "loaded application",
+			started: EventApplicationLoaded{Name: "test-app-loaded", Node: node.Name(), Weight: 50},
+			desc:    "loaded application",
 		},
 		{
 			route: gen.ApplicationRoute{
@@ -1034,6 +822,12 @@ func TestIntegrationApplicationEvents(t *testing.T) {
 				Name:   "test-app-running",
 				Weight: 75,
 				State:  gen.ApplicationStateRunning,
+				Mode:   gen.ApplicationModeTransient,
+			},
+			started: EventApplicationStarted{
+				Name:   "test-app-running",
+				Node:   node.Name(),
+				Weight: 75,
 				Mode:   gen.ApplicationModeTransient,
 			},
 			desc: "running application",
@@ -1046,32 +840,34 @@ func TestIntegrationApplicationEvents(t *testing.T) {
 				State:  gen.ApplicationStateStopping,
 				Mode:   gen.ApplicationModeTransient,
 			},
-			desc: "stopping application",
+			started: EventApplicationStopping{Name: "test-app-stopping", Node: node.Name()},
+			desc:    "stopping application",
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.desc, func(t *testing.T) {
-			// Register application route
-			err = client.RegisterApplicationRoute(tc.route)
-			if err != nil {
+			if err := client.RegisterApplicationRoute(tc.route); err != nil {
 				t.Fatalf("Failed to register application route: %v", err)
 			}
 
-			// Give time for event propagation
-			time.Sleep(100 * time.Millisecond)
+			node.ShouldSendEvent().
+				Name(eventName).
+				Where(eventMessage(tc.started)).
+				Within(5 * time.Second).
+				AtLeast(1).
+				Assert()
 
-			// Verify application route was stored
-			// In a real test, we'd verify the event was sent to subscribers
-
-			// Test EventApplicationStopped: Unregister application route
-			err = client.UnregisterApplicationRoute(tc.route.Name)
-			if err != nil {
+			if err := client.UnregisterApplicationRoute(tc.route.Name); err != nil {
 				t.Fatalf("Failed to unregister application route: %v", err)
 			}
 
-			// Give time for event propagation
-			time.Sleep(100 * time.Millisecond)
+			node.ShouldSendEvent().
+				Name(eventName).
+				Where(eventMessage(EventApplicationStopped{Name: tc.route.Name, Node: node.Name()})).
+				Within(5 * time.Second).
+				AtLeast(1).
+				Assert()
 		})
 	}
 }
@@ -1094,7 +890,7 @@ func TestIntegrationConfigurationEvents(t *testing.T) {
 	defer registrar.Terminate()
 
 	client := registrar.(*client)
-	node := newMockNode("config-test-node")
+	node := newMockNode(t, "config-test-node")
 
 	_, err = client.Register(node, gen.RegisterRoutes{
 		Routes: []gen.Route{{Host: "localhost", Port: 9001, TLS: false}},
@@ -1182,7 +978,7 @@ func TestIntegrationEventSystemIntegrity(t *testing.T) {
 
 	// Create multiple registrars to simulate a real cluster
 	registrars := make([]*client, 3)
-	mockNodes := make([]*mockNode, 3)
+	mockNodes := make([]*mock.Node, 3)
 
 	for i := 0; i < 3; i++ {
 		registrar, err := Create(Options{
@@ -1195,7 +991,7 @@ func TestIntegrationEventSystemIntegrity(t *testing.T) {
 		defer registrar.Terminate()
 
 		registrars[i] = registrar.(*client)
-		mockNodes[i] = newMockNode(fmt.Sprintf("integrity-node-%d", i))
+		mockNodes[i] = newMockNode(t, fmt.Sprintf("integrity-node-%d", i))
 
 		_, err = registrars[i].Register(mockNodes[i], gen.RegisterRoutes{
 			Routes: []gen.Route{{Host: "localhost", Port: uint16(9001 + i), TLS: false}},

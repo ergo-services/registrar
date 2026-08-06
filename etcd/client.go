@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"ergo.services/ergo/gen"
@@ -78,8 +79,12 @@ type appEntry struct {
 type client struct {
 	options Options
 
-	cli      *etcdcli.Client
-	lease    etcdcli.LeaseID
+	cli *etcdcli.Client
+
+	// lease holds the current etcd lease ID. keepRegistration replaces it on
+	// every re-registration while the node goroutine reads it through
+	// RegisterApplicationRoute, so access goes through leaseID/setLeaseID.
+	lease    atomic.Int64
 	leaseTTL int64 // TTL for etcd lease in seconds
 
 	node gen.NodeRegistrar

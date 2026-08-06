@@ -34,7 +34,7 @@ func TestProxyBasicOperation(t *testing.T) {
 	defer registrar.Terminate()
 
 	client := registrar.(*client)
-	node := newMockNode("proxy-test-node")
+	node := newMockNode(t, "proxy-test-node")
 
 	routes := gen.RegisterRoutes{
 		Routes: []gen.Route{{Host: "localhost", Port: 9001, TLS: false}},
@@ -83,7 +83,7 @@ func TestProxyNetworkPartition(t *testing.T) {
 	defer registrar.Terminate()
 
 	client := registrar.(*client)
-	node := newMockNode("partition-node")
+	node := newMockNode(t, "partition-node")
 
 	routes := gen.RegisterRoutes{
 		Routes: []gen.Route{{Host: "localhost", Port: 9001, TLS: false}},
@@ -95,7 +95,7 @@ func TestProxyNetworkPartition(t *testing.T) {
 		t.Fatalf("Failed to register: %v", err)
 	}
 
-	initialLease := client.lease
+	initialLease := client.leaseID()
 	t.Logf("Initial lease: %d", initialLease)
 
 	// SIMULATE NETWORK PARTITION
@@ -124,7 +124,7 @@ func TestProxyNetworkPartition(t *testing.T) {
 	// Wait for node to detect network restoration and re-register
 	time.Sleep(3 * time.Second)
 
-	newLease := client.lease
+	newLease := client.leaseID()
 	t.Logf("New lease after recovery: %d", newLease)
 
 	if newLease == 0 {
@@ -181,7 +181,7 @@ func TestProxyRaceCondition(t *testing.T) {
 	defer registrar1.Terminate()
 
 	client1 := registrar1.(*client)
-	node1 := newMockNode("race-node")
+	node1 := newMockNode(t, "race-node")
 
 	routes := gen.RegisterRoutes{
 		Routes: []gen.Route{{Host: "localhost", Port: 9001, TLS: false}},
@@ -214,7 +214,7 @@ func TestProxyRaceCondition(t *testing.T) {
 	defer registrar2.Terminate()
 
 	client2 := registrar2.(*client)
-	node2 := newMockNode("race-node") // Same name!
+	node2 := newMockNode(t, "race-node") // Same name!
 
 	_, err = client2.Register(node2, routes)
 	if err != nil {
@@ -242,9 +242,9 @@ func TestProxyRaceCondition(t *testing.T) {
 	}
 
 	// Key should be owned by Node2's lease
-	if getResp.Kvs[0].Lease != int64(client2.lease) {
+	if getResp.Kvs[0].Lease != int64(client2.leaseID()) {
 		t.Errorf("Expected Node2 to own the name (lease %d), but got lease %d",
-			client2.lease, getResp.Kvs[0].Lease)
+			client2.leaseID(), getResp.Kvs[0].Lease)
 	}
 
 	t.Log("Node2 correctly retained ownership despite Node1 recovery")
@@ -274,7 +274,7 @@ func TestProxyIntermittentConnection(t *testing.T) {
 	defer registrar.Terminate()
 
 	client := registrar.(*client)
-	node := newMockNode("flaky-node")
+	node := newMockNode(t, "flaky-node")
 
 	routes := gen.RegisterRoutes{
 		Routes: []gen.Route{{Host: "localhost", Port: 9001, TLS: false}},
@@ -285,7 +285,7 @@ func TestProxyIntermittentConnection(t *testing.T) {
 		t.Fatalf("Failed to register: %v", err)
 	}
 
-	initialLease := client.lease
+	initialLease := client.leaseID()
 
 	// Simulate flaky network: drop connections repeatedly
 	for i := 0; i < 3; i++ {
@@ -295,7 +295,7 @@ func TestProxyIntermittentConnection(t *testing.T) {
 	}
 
 	// Lease should be the same (keepAlive reconnected each time)
-	currentLease := client.lease
+	currentLease := client.leaseID()
 	if currentLease != initialLease {
 		t.Errorf("Lease changed from %d to %d (should have survived flaky network)",
 			initialLease, currentLease)
@@ -340,7 +340,7 @@ func TestProxyStatistics(t *testing.T) {
 	defer registrar.Terminate()
 
 	client := registrar.(*client)
-	node := newMockNode("stats-node")
+	node := newMockNode(t, "stats-node")
 
 	routes := gen.RegisterRoutes{
 		Routes: []gen.Route{{Host: "localhost", Port: 9001, TLS: false}},
