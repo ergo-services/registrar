@@ -18,7 +18,9 @@ help:
 # Test configuration
 ETCD_ENDPOINTS := localhost:12379
 GO_TEST_TIMEOUT := 300s
-TEST_FLAGS := -timeout $(GO_TEST_TIMEOUT)
+# -count=1 is the documented way to bypass the test cache: without it a second run
+# reports the first one's result and nothing is executed
+TEST_FLAGS := -timeout $(GO_TEST_TIMEOUT) -count=1
 
 # Start etcd container
 start-etcd:
