@@ -4,6 +4,17 @@ import (
 	"ergo.services/ergo/gen"
 )
 
+// Registrar session events. They let a consumer tell "the registrar lost its
+// session" from "a node left the cluster", which is the difference between
+// waiting and evicting.
+type EventRegistrarConnected struct {
+	Info gen.RegistrarInfo
+}
+
+type EventRegistrarDisconnected struct {
+	Reason error
+}
+
 // Configuration update events
 type EventConfigUpdate struct {
 	Item  string

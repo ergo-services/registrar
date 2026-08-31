@@ -39,11 +39,8 @@ func appRoute(node gen.Atom, name gen.Atom, weight int) gen.ApplicationRoute {
 	}
 }
 
-// TestIntegrationReRegisterKeepsApplicationRoutes covers the re-registration
-// path taken when the client lost its keepalive session while the lease is
-// still alive on the server (what an etcd leader change produces). Application
-// routes must be re-attached to the new lease in place: the keys must survive,
-// and no watcher in the cluster may observe them as removed.
+// TestIntegrationReRegisterKeepsApplicationRoutes: re-registration must
+// re-attach application routes to the new lease, not drop and recreate them.
 func TestIntegrationReRegisterKeepsApplicationRoutes(t *testing.T) {
 	endpoints := getTestEndpoints()
 	if endpoints == nil {
@@ -112,10 +109,8 @@ func TestIntegrationReRegisterKeepsApplicationRoutes(t *testing.T) {
 		Assert()
 }
 
-// TestIntegrationRequestTimeoutWhenEtcdUnreachable checks that no registrar call
-// blocks indefinitely when etcd stops answering. clientv3 calls default to
-// grpc.WaitForReady(true), so a call without a deadline waits for as long as the
-// connection stays down.
+// TestIntegrationRequestTimeoutWhenEtcdUnreachable checks that no registrar
+// call blocks indefinitely when etcd stops answering.
 func TestIntegrationRequestTimeoutWhenEtcdUnreachable(t *testing.T) {
 	endpoints := getTestEndpoints()
 	if endpoints == nil {
@@ -188,10 +183,8 @@ func TestIntegrationRequestTimeoutWhenEtcdUnreachable(t *testing.T) {
 }
 
 // TestIntegrationRouteRegistrationDuringLeaseSwitch hammers
-// RegisterApplicationRoute from several goroutines while the lease is replaced
-// underneath them. Run with -race: the lease is written by the re-registration
-// path and read by every caller. No route may be lost, and each one must end up
-// attached to the lease the node is finally registered with.
+// RegisterApplicationRoute from several goroutines while the lease is
+// replaced underneath them.
 func TestIntegrationRouteRegistrationDuringLeaseSwitch(t *testing.T) {
 	endpoints := getTestEndpoints()
 	if endpoints == nil {

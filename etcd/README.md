@@ -2,6 +2,12 @@
 
 A `gen.Registrar` implementation for [etcd](https://etcd.io/) - a distributed, reliable key-value store for the most critical data of a distributed system.
 
+## Requirements
+
+- **etcd 3.6 or newer.** The client library supports one minor version back, so
+  a 3.5 server is refused at startup with a clear error. Newer servers are fine.
+- **Go 1.26 or newer**, the floor set by the etcd client library.
+
 ## Features
 
 - **Distributed Service Discovery**: No single point of failure

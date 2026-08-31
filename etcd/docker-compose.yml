@@ -1,6 +1,11 @@
+# Pinned to the version that is deployed: the client supports one minor back,
+# and lease and watch behaviour is where this registrar lives. Deliberately
+# unlike production: no auth, and no auto compaction (compaction is exercised
+# explicitly by TestIntegrationWatchResyncsAfterCompaction). Single member, so
+# anything needing a leader change cannot be reproduced here.
 services:
   etcd:
-    image: quay.io/coreos/etcd:v3.5.13
+    image: quay.io/coreos/etcd:v3.6.4
     container_name: etcd-registrar-test
     command:
       - /usr/local/bin/etcd
@@ -38,7 +43,7 @@ services:
 
   # Authentication setup service
   auth-setup:
-    image: quay.io/coreos/etcd:v3.5.13
+    image: quay.io/coreos/etcd:v3.6.4
     container_name: etcd-auth-setup
     depends_on:
       etcd:

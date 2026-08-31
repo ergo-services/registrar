@@ -191,7 +191,7 @@ func TestRotateConcurrent(t *testing.T) {
 	}
 }
 
-func TestSnapshotAppRoutesIncludesAll(t *testing.T) {
+func TestSplitAppRoutesIncludesAll(t *testing.T) {
 	// Self-fairness check at the snapshot layer: the snapshot must include
 	// every node in the routes map without filtering self. The etcd client
 	// no longer hides the local node; rotation handles it as a peer.
@@ -201,23 +201,19 @@ func TestSnapshotAppRoutesIncludesAll(t *testing.T) {
 			"peer@h": {Node: "peer@h", Weight: 1},
 		},
 	}
-	got := snapshotAppRoutes(entry)
-	if len(got) != 2 {
-		t.Fatalf("snapshot length: got %d, want 2", len(got))
+	healthy, suspect := splitAppRoutes(entry)
+	if len(healthy) != 2 || len(suspect) != 0 {
+		t.Fatalf("split: got %d healthy and %d suspect, want 2 and 0", len(healthy), len(suspect))
 	}
-	if got[0].Node != "peer@h" || got[1].Node != "self@h" {
-		t.Fatalf("snapshot not name-sorted: %v %v", got[0].Node, got[1].Node)
+	if healthy[0].Node != "peer@h" || healthy[1].Node != "self@h" {
+		t.Fatalf("snapshot not name-sorted: %v %v", healthy[0].Node, healthy[1].Node)
 	}
 }
 
-func TestUpdateAppCachePutBumpsRrGen(t *testing.T) {
-	c := &client{appCache: map[gen.Atom]*appEntry{
-		"myapp": {routes: map[gen.Atom]gen.ApplicationRoute{}, rev: 0},
-	}}
-	entry := c.appCache["myapp"]
-
-	c.updateAppCachePut("myapp", "a@h",
-		gen.ApplicationRoute{Node: "a@h", Name: "myapp", Weight: 1}, 1)
+func TestMirrorPutBumpsRrGen(t *testing.T) {
+	m := newMirror()
+	m.putAppRoute("myapp", "a@h", gen.ApplicationRoute{Node: "a@h", Name: "myapp", Weight: 1}, 1)
+	entry := m.apps["myapp"]
 
 	if entry.rrGen != 1 {
 		t.Fatalf("rrGen after Put: got %d, want 1", entry.rrGen)
@@ -227,83 +223,67 @@ func TestUpdateAppCachePutBumpsRrGen(t *testing.T) {
 	}
 }
 
-func TestUpdateAppCacheDeleteBumpsRrGen(t *testing.T) {
-	c := &client{appCache: map[gen.Atom]*appEntry{
-		"myapp": {
-			routes: map[gen.Atom]gen.ApplicationRoute{
-				"a@h": {Node: "a@h", Name: "myapp", Weight: 1},
-			},
-			rev: 1,
-		},
-	}}
-	entry := c.appCache["myapp"]
+func TestMirrorRemoveBumpsRrGen(t *testing.T) {
+	m := newMirror()
+	m.putAppRoute("myapp", "a@h", gen.ApplicationRoute{Node: "a@h", Name: "myapp", Weight: 1}, 1)
+	m.putAppRoute("myapp", "b@h", gen.ApplicationRoute{Node: "b@h", Name: "myapp", Weight: 1}, 1)
+	entry := m.apps["myapp"]
+	before := entry.rrGen
 
-	c.updateAppCacheDelete("myapp", "a@h", 2)
+	m.removeAppRoute("myapp", "a@h", 2)
 
-	if entry.rrGen != 1 {
-		t.Fatalf("rrGen after Delete: got %d, want 1", entry.rrGen)
+	if entry.rrGen != before+1 {
+		t.Fatalf("rrGen after remove: got %d, want %d", entry.rrGen, before+1)
 	}
 	if _, ok := entry.routes["a@h"]; ok {
 		t.Fatalf("route a@h not removed")
 	}
 }
 
-func TestUpdateAppCacheStaleRevIgnored(t *testing.T) {
-	// Watch events older than entry.rev must be ignored entirely — neither
-	// routes nor rrGen should change. Otherwise a late delivery could
-	// trigger spurious rebuilds and quietly corrupt the cache.
-	c := &client{appCache: map[gen.Atom]*appEntry{
-		"myapp": {
-			routes: map[gen.Atom]gen.ApplicationRoute{
-				"a@h": {Node: "a@h", Name: "myapp", Weight: 1},
-			},
-			rev: 10,
-		},
-	}}
-	entry := c.appCache["myapp"]
+func TestMirrorStaleRevIgnored(t *testing.T) {
+	// Watch events older than entry.rev must be ignored entirely, neither
+	// routes nor rrGen may change. Otherwise a late delivery could trigger
+	// spurious rebuilds and quietly corrupt the mirror.
+	m := newMirror()
+	m.putAppRoute("myapp", "a@h", gen.ApplicationRoute{Node: "a@h", Name: "myapp", Weight: 1}, 10)
+	entry := m.apps["myapp"]
+	rrGen := entry.rrGen
 
-	c.updateAppCachePut("myapp", "b@h",
-		gen.ApplicationRoute{Node: "b@h", Name: "myapp", Weight: 1}, 5)
-	c.updateAppCacheDelete("myapp", "a@h", 5)
+	m.putAppRoute("myapp", "b@h", gen.ApplicationRoute{Node: "b@h", Name: "myapp", Weight: 1}, 5)
+	m.removeAppRoute("myapp", "a@h", 5)
 
-	if entry.rrGen != 0 {
-		t.Fatalf("rrGen bumped on stale rev: got %d, want 0", entry.rrGen)
+	if entry.rrGen != rrGen {
+		t.Fatalf("rrGen bumped on stale rev: got %d, want %d", entry.rrGen, rrGen)
 	}
 	if _, ok := entry.routes["b@h"]; ok {
 		t.Fatalf("stale Put applied")
 	}
 	if _, ok := entry.routes["a@h"]; ok == false {
-		t.Fatalf("stale Delete applied")
+		t.Fatalf("stale remove applied")
 	}
 }
 
 func TestRotationAfterWatchPutIncludesNewNode(t *testing.T) {
 	// Warm rotation on a two-node set so rrState carries skew, then deliver
 	// a Watch-Put for a third node. The post-Put rotation must include the
-	// newcomer with a fair share, proving that rrGen bump → next wrrStep
-	// rebuilds from scratch rather than carrying old current_weights.
-	c := &client{appCache: map[gen.Atom]*appEntry{
-		"myapp": {
-			routes: map[gen.Atom]gen.ApplicationRoute{
-				"a@h": {Node: "a@h", Name: "myapp", Weight: 1},
-				"b@h": {Node: "b@h", Name: "myapp", Weight: 1},
-			},
-			rev:   1,
-			rrGen: 1,
-		},
-	}}
-	entry := c.appCache["myapp"]
+	// newcomer with a fair share, proving that rrGen bump leads the next
+	// wrrStep to rebuild rather than carry old current_weights.
+	m := newMirror()
+	m.putAppRoute("myapp", "a@h", gen.ApplicationRoute{Node: "a@h", Name: "myapp", Weight: 1}, 1)
+	m.putAppRoute("myapp", "b@h", gen.ApplicationRoute{Node: "b@h", Name: "myapp", Weight: 1}, 1)
+	entry := m.apps["myapp"]
 
 	for i := 0; i < 4; i++ {
-		rotateAppRoutes(entry, snapshotAppRoutes(entry), entry.rrGen)
+		healthy, _ := splitAppRoutes(entry)
+		rotateAppRoutes(entry, healthy, entry.rrGen)
 	}
 
-	c.updateAppCachePut("myapp", "c@h",
-		gen.ApplicationRoute{Node: "c@h", Name: "myapp", Weight: 1}, 2)
+	m.putAppRoute("myapp", "c@h", gen.ApplicationRoute{Node: "c@h", Name: "myapp", Weight: 1}, 2)
 
 	counts := map[gen.Atom]int{}
 	for i := 0; i < 6; i++ {
-		result := rotateAppRoutes(entry, snapshotAppRoutes(entry), entry.rrGen)
+		healthy, _ := splitAppRoutes(entry)
+		result := rotateAppRoutes(entry, healthy, entry.rrGen)
 		counts[result[0].Node]++
 	}
 	if counts["a@h"] != 2 || counts["b@h"] != 2 || counts["c@h"] != 2 {
@@ -312,28 +292,23 @@ func TestRotationAfterWatchPutIncludesNewNode(t *testing.T) {
 }
 
 func TestRotationAfterWatchDeleteSkipsNode(t *testing.T) {
-	c := &client{appCache: map[gen.Atom]*appEntry{
-		"myapp": {
-			routes: map[gen.Atom]gen.ApplicationRoute{
-				"a@h": {Node: "a@h", Name: "myapp", Weight: 1},
-				"b@h": {Node: "b@h", Name: "myapp", Weight: 1},
-				"c@h": {Node: "c@h", Name: "myapp", Weight: 1},
-			},
-			rev:   1,
-			rrGen: 1,
-		},
-	}}
-	entry := c.appCache["myapp"]
+	m := newMirror()
+	for _, node := range []gen.Atom{"a@h", "b@h", "c@h"} {
+		m.putAppRoute("myapp", node, gen.ApplicationRoute{Node: node, Name: "myapp", Weight: 1}, 1)
+	}
+	entry := m.apps["myapp"]
 
 	for i := 0; i < 3; i++ {
-		rotateAppRoutes(entry, snapshotAppRoutes(entry), entry.rrGen)
+		healthy, _ := splitAppRoutes(entry)
+		rotateAppRoutes(entry, healthy, entry.rrGen)
 	}
 
-	c.updateAppCacheDelete("myapp", "c@h", 2)
+	m.removeAppRoute("myapp", "c@h", 2)
 
 	counts := map[gen.Atom]int{}
 	for i := 0; i < 4; i++ {
-		result := rotateAppRoutes(entry, snapshotAppRoutes(entry), entry.rrGen)
+		healthy, _ := splitAppRoutes(entry)
+		result := rotateAppRoutes(entry, healthy, entry.rrGen)
 		counts[result[0].Node]++
 	}
 	if counts["c@h"] != 0 {

@@ -9,9 +9,7 @@ import (
 	"ergo.services/ergo/testing/mock"
 )
 
-// newMockNode returns a gen.NodeRegistrar backed by the ergo mock harness. The
-// node records every RegisterEvent/SendEvent the registrar performs, so tests
-// assert published events with the check grammar (node.ShouldSendEvent()...).
+// newMockNode returns a gen.NodeRegistrar backed by the ergo mock harness.
 func newMockNode(t *testing.T, name string) *mock.Node {
 	node := mock.NewNodeT(t)
 	node.OnName(func() gen.Atom { return gen.Atom(name) })

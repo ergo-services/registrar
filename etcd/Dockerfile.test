@@ -4,7 +4,7 @@ FROM golang:1.24-alpine
 RUN apk add --no-cache git curl bash
 
 # Install etcdctl for debugging and verification
-RUN ETCD_VER=v3.5.13 && \
+RUN ETCD_VER=v3.6.4 && \
     curl -L https://github.com/etcd-io/etcd/releases/download/${ETCD_VER}/etcd-${ETCD_VER}-linux-amd64.tar.gz \
     -o /tmp/etcd-${ETCD_VER}-linux-amd64.tar.gz && \
     tar xzf /tmp/etcd-${ETCD_VER}-linux-amd64.tar.gz -C /tmp --strip-components=1 && \

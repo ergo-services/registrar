@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"ergo.services/ergo/gen"
+	etcdcli "go.etcd.io/etcd/client/v3"
 )
 
 // TestProxyBasicOperation tests that proxy correctly forwards traffic
@@ -121,32 +122,30 @@ func TestProxyNetworkPartition(t *testing.T) {
 	proxy.Unblock()
 	t.Log("Unblocked - network restored")
 
-	// Wait for node to detect network restoration and re-register
-	time.Sleep(3 * time.Second)
-
-	newLease := client.leaseID()
-	t.Logf("New lease after recovery: %d", newLease)
-
-	if newLease == 0 {
-		t.Error("Expected node to re-register after network recovery")
-	}
-
-	if newLease == initialLease {
-		t.Error("Expected new lease after partition recovery")
-	}
-
-	// Verify node is registered in etcd
+	// A closed keepalive channel is checked against the server before anything
+	// is rebuilt, so a lease that outlived the partition is kept and nothing is
+	// republished. Whether the lease is the same or a new one is therefore not
+	// the property to assert, and the check costs up to one TTL before a
+	// re-registration starts. What must hold: the node ends up registered, with
+	// the lease it currently holds.
 	key := client.pathNodes + string(node.Name())
-	getResp, err := client.cli.Get(context.Background(), key)
-	if err != nil {
-		t.Fatalf("Failed to get key: %v", err)
-	}
+	var recoveredLease etcdcli.LeaseID
 
-	if getResp.Count == 0 {
-		t.Fatal("Expected node to be registered after recovery")
-	}
+	waitFor(t, 30*time.Second, func() bool {
+		recoveredLease = client.leaseID()
+		if recoveredLease == 0 {
+			return false
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		resp, err := client.cli.Get(ctx, key)
+		if err != nil || resp.Count == 0 {
+			return false
+		}
+		return resp.Kvs[0].Lease == int64(recoveredLease)
+	}, "node did not recover after the partition")
 
-	t.Logf("Node successfully recovered after partition")
+	t.Logf("Node recovered after partition with lease %d (initial %d)", recoveredLease, initialLease)
 }
 
 // TestProxyRaceCondition tests race between two nodes during partition recovery
