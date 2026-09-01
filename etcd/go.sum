@@ -1,5 +1,5 @@
-ergo.services/ergo v1.999.321-0.20260831132002-e36ca64a2801 h1:0QQLbEQ4AcRj67zwtJ4ESYf7BIHMbmXuELmzHCDLgzI=
-ergo.services/ergo v1.999.321-0.20260831132002-e36ca64a2801/go.mod h1:2WcCdXUIZvCfy9Kkac3Sx6V/tB23Mx3yK6xz77hRfbM=
+ergo.services/ergo v1.999.321-0.20260901122121-9b4168dab6c3 h1:1Mmk7OFRwOG2LCnzyHhfJx9AuRr1WMNReOwiaLq2/Wk=
+ergo.services/ergo v1.999.321-0.20260901122121-9b4168dab6c3/go.mod h1:2WcCdXUIZvCfy9Kkac3Sx6V/tB23Mx3yK6xz77hRfbM=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
 github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
 github.com/coreos/go-semver v0.3.1 h1:yi21YpKnrx1gt5R+la8n5WgS0kCrsPp33dmEyHReZr4=
