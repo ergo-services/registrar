@@ -3,11 +3,14 @@ package etcd
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"ergo.services/ergo/gen"
+	etcdversion "go.etcd.io/etcd/api/v3/version"
 	etcdcli "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
 )
@@ -18,6 +21,7 @@ const (
 	formatPathClusterRoutes = pathPrefix + "/cluster/%s/routes/" // Non-overlapping with config
 	formatPathNodes         = pathPrefix + "/cluster/%s/routes/nodes/"
 	formatPathApps          = pathPrefix + "/cluster/%s/routes/applications/"
+	formatPathLeaving       = pathPrefix + "/cluster/%s/routes/leaving/"
 	formatPathConfig        = pathPrefix + "/cluster/%s/config/"
 	formatPathGlobalConfig  = pathPrefix + "/config/"
 
@@ -25,6 +29,15 @@ const (
 	defaultDialTimeout    = 10 * time.Second
 	defaultRequestTimeout = 10 * time.Second
 	defaultKeepAlive      = 10 * time.Second
+
+	// Suspicion lifetime and the resolution of its clock.
+	defaultSuspectGrace  = 30 * time.Second
+	defaultSweepInterval = time.Second
+
+	// A broken watch is rebuilt in place; the session only after this many fails.
+	watchRetryMin         = 100 * time.Millisecond
+	watchRetryMax         = 2 * time.Second
+	watchRecoveryAttempts = 5
 )
 
 // Configuration Key Format:
@@ -56,20 +69,31 @@ var (
 	defaultEndpoins = []string{"localhost:2379"}
 )
 
-// appEntry is a cache entry for ResolveApplication results.
-// rev is the etcd revision at which routes were last known to be accurate:
-// either Header.Revision from the Get that populated the entry, or
-// Kv.ModRevision from a Watch event that updated it.
+// appEntry holds every known route of one application, keyed by node name.
+// rev is the revision the entry was last known accurate at.
 type appEntry struct {
-	routes map[gen.Atom]gen.ApplicationRoute // keyed by node name
-	rev    int64
+	routes  map[gen.Atom]gen.ApplicationRoute // keyed by node name
+	suspect map[gen.Atom]int                  // node -> grace ticks left, nil when healthy
+	rev     int64
+
+	// rrGen is bumped under appCacheLock whenever routes is mutated.
+	// rrState/rrSeen are protected by rrLock and rebuilt lazily when
+	// rrSeen != observed rrGen. Separating rrLock from appCacheLock keeps
+	// the read-mostly cache path free of write-lock contention during
+	// the smooth-WRR step that mutates rotation state.
+	rrGen   uint64
+	rrLock  sync.Mutex
+	rrSeen  uint64
+	rrState map[gen.Atom]int // smooth-WRR current_weight
 }
 
 type client struct {
 	options Options
 
-	cli      *etcdcli.Client
-	lease    etcdcli.LeaseID
+	cli *etcdcli.Client
+
+	// Replaced by keepRegistration while callers read it, hence leaseID/setLeaseID.
+	lease    atomic.Int64
 	leaseTTL int64 // TTL for etcd lease in seconds
 
 	node gen.NodeRegistrar
@@ -81,6 +105,7 @@ type client struct {
 	pathClusterRoutes string // Non-overlapping with config - uses edf.Encode + base64
 	pathNodes         string
 	pathApps          string
+	pathLeaving       string // departure markers, see departGracefully
 	pathConfig        string // Uses string encoding with type prefixes
 	pathGlobalConfig  string
 
@@ -90,13 +115,21 @@ type client struct {
 	configLock sync.RWMutex
 	apps       sync.Map // map[gen.Atom]gen.ApplicationRoute — local apps, kept for re-registration
 
-	appCache     map[gen.Atom]*appEntry // lazy cache for ResolveApplication, updated by Watch
-	appCacheLock sync.RWMutex
+	mirror *mirror // full in-memory view of the cluster, seeded and watched
 
 	event    gen.Event
 	eventRef gen.Ref
 
 	state int32 // 0 unregistered, 1 registered, 2 terminated
+
+	// counters, read for diagnostics only
+	statResolvedFromSuspect atomic.Int64
+	statExpiredAfterGrace   atomic.Int64
+	statSeeds               atomic.Int64
+	statSessionRevived      atomic.Int64 // keepalive resumed on the same lease
+	statSessionRebuilt      atomic.Int64 // lease was really gone, re-registered
+	statWatchResumed        atomic.Int64 // watch rebuilt without touching the session
+	statWatchResync         atomic.Int64 // watch position compacted away
 }
 
 // Options for ETCD registrar with authentication and security support
@@ -120,6 +153,15 @@ type Options struct {
 	// LeaseTTL in seconds (default 10)
 	// For testing, can be set to 1-2 seconds to speed up lease expiration
 	LeaseTTL int64
+
+	// SuspectGrace is how long a route whose loss could not be attributed to its
+	// owner stays resolvable, deprioritized, before it is dropped. Default 30s,
+	// jittered by up to 20% per route.
+	SuspectGrace time.Duration
+
+	// SweepInterval is the resolution of the suspicion clock, default 1s. It
+	// only advances while the watch is established.
+	SweepInterval time.Duration
 }
 
 func Create(options Options) (gen.Registrar, error) {
@@ -141,6 +183,14 @@ func Create(options Options) (gen.Registrar, error) {
 
 	if options.LeaseTTL == 0 {
 		options.LeaseTTL = 10 // default 10 seconds
+	}
+
+	if options.SuspectGrace == 0 {
+		options.SuspectGrace = defaultSuspectGrace
+	}
+
+	if options.SweepInterval == 0 {
+		options.SweepInterval = defaultSweepInterval
 	}
 
 	if options.KeepAlive == 0 {
@@ -187,6 +237,11 @@ func Create(options Options) (gen.Registrar, error) {
 
 	cli, err := etcdcli.New(config)
 	if err != nil {
+		if errors.Is(err, etcdcli.ErrOldCluster) {
+			// The client supports one minor back: this needs a server upgrade.
+			return nil, fmt.Errorf("etcd server is too old for client %s, it needs etcd 3.6 or newer: %w",
+				etcdversion.Version, err)
+		}
 		return nil, fmt.Errorf("failed to create etcd client: %w", err)
 	}
 
@@ -202,10 +257,11 @@ func Create(options Options) (gen.Registrar, error) {
 		pathClusterRoutes: fmt.Sprintf(formatPathClusterRoutes, options.Cluster),
 		pathNodes:         fmt.Sprintf(formatPathNodes, options.Cluster),
 		pathApps:          fmt.Sprintf(formatPathApps, options.Cluster),
+		pathLeaving:       fmt.Sprintf(formatPathLeaving, options.Cluster),
 		pathConfig:        fmt.Sprintf(formatPathConfig, options.Cluster),
 		pathGlobalConfig:  formatPathGlobalConfig,
 		config:            make(map[string]any),
-		appCache:          make(map[gen.Atom]*appEntry),
+		mirror:            newMirror(),
 	}
 
 	return client, nil

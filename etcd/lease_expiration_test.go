@@ -37,7 +37,7 @@ func TestIntegrationLeaseExpiration(t *testing.T) {
 		defer registrar.Terminate()
 
 		client := registrar.(*client)
-		node := newMockNode("test-node-expiry")
+		node := newMockNode(t, "test-node-expiry")
 
 		routes := gen.RegisterRoutes{
 			Routes: []gen.Route{{Host: "localhost", Port: 9001, TLS: false}},
@@ -49,7 +49,7 @@ func TestIntegrationLeaseExpiration(t *testing.T) {
 			t.Fatalf("Failed to register: %v", err)
 		}
 
-		initialLease := client.lease
+		initialLease := client.leaseID()
 		if initialLease == 0 {
 			t.Fatal("Expected non-zero lease ID after registration")
 		}
@@ -71,7 +71,7 @@ func TestIntegrationLeaseExpiration(t *testing.T) {
 		time.Sleep(4 * time.Second)
 
 		// Node should have automatically re-registered with new lease
-		newLease := client.lease
+		newLease := client.leaseID()
 		if newLease == 0 {
 			t.Error("Expected non-zero lease ID after re-registration")
 		}
@@ -130,7 +130,7 @@ func TestIntegrationLeaseExpiration(t *testing.T) {
 		defer registrar1.Terminate()
 
 		client1 := registrar1.(*client)
-		node1 := newMockNode("race-node")
+		node1 := newMockNode(t, "race-node")
 
 		routes := gen.RegisterRoutes{
 			Routes: []gen.Route{{Host: "localhost", Port: 9001, TLS: false}},
@@ -142,7 +142,7 @@ func TestIntegrationLeaseExpiration(t *testing.T) {
 			t.Fatalf("Failed to register node1: %v", err)
 		}
 
-		lease1 := client1.lease
+		lease1 := client1.leaseID()
 		t.Logf("Node1 registered with lease %d", lease1)
 
 		// Simulate network partition for Node1
@@ -166,7 +166,7 @@ func TestIntegrationLeaseExpiration(t *testing.T) {
 		defer registrar2.Terminate()
 
 		client2 := registrar2.(*client)
-		node2 := newMockNode("race-node") // Same name!
+		node2 := newMockNode(t, "race-node") // Same name!
 
 		// Node2 should successfully register (Node1's lease expired)
 		_, err = client2.Register(node2, routes)
@@ -174,7 +174,7 @@ func TestIntegrationLeaseExpiration(t *testing.T) {
 			t.Fatalf("Node2 failed to register: %v", err)
 		}
 
-		lease2 := client2.lease
+		lease2 := client2.leaseID()
 		t.Logf("Node2 registered with lease %d (same name!)", lease2)
 
 		// Restore Node1's network
@@ -206,13 +206,13 @@ func TestIntegrationLeaseExpiration(t *testing.T) {
 		// 1. Only ONE node owns the name at a time
 		// 2. The system eventually converges to a consistent state
 
-		if finalLease == int64(client2.lease) {
-			t.Logf("SUCCESS: Node2 retained ownership (lease %d)", client2.lease)
-		} else if finalLease == int64(client1.lease) {
-			t.Logf("Node1 won the race (lease %d) - acceptable in distributed systems", client1.lease)
+		if finalLease == int64(client2.leaseID()) {
+			t.Logf("SUCCESS: Node2 retained ownership (lease %d)", client2.leaseID())
+		} else if finalLease == int64(client1.leaseID()) {
+			t.Logf("Node1 won the race (lease %d) - acceptable in distributed systems", client1.leaseID())
 		} else {
 			t.Errorf("Unexpected lease owner: %d (Node1=%d, Node2=%d)",
-				finalLease, client1.lease, client2.lease)
+				finalLease, client1.leaseID(), client2.leaseID())
 		}
 
 		// Verify only one registration exists
@@ -241,7 +241,7 @@ func TestIntegrationLeaseExpiration(t *testing.T) {
 		defer registrar.Terminate()
 
 		client := registrar.(*client)
-		node := newMockNode("multi-expire-node")
+		node := newMockNode(t, "multi-expire-node")
 
 		routes := gen.RegisterRoutes{
 			Routes: []gen.Route{{Host: "localhost", Port: 9001, TLS: false}},
@@ -252,8 +252,8 @@ func TestIntegrationLeaseExpiration(t *testing.T) {
 			t.Fatalf("Failed to register: %v", err)
 		}
 
-		leases := []interface{}{client.lease}
-		t.Logf("Initial lease: %d", client.lease)
+		leases := []interface{}{client.leaseID()}
+		t.Logf("Initial lease: %d", client.leaseID())
 
 		// Simulate 3 partition/recovery cycles
 		for i := 1; i <= 3; i++ {
@@ -273,7 +273,7 @@ func TestIntegrationLeaseExpiration(t *testing.T) {
 			// Wait for re-registration (needs time for detection + backoff + reconnect)
 			time.Sleep(4 * time.Second)
 
-			newLease := client.lease
+			newLease := client.leaseID()
 			t.Logf("Cycle %d: New lease = %d", i, newLease)
 
 			// Verify lease changed

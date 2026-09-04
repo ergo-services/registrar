@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"ergo.services/ergo/gen"
+	etcdcli "go.etcd.io/etcd/client/v3"
 )
 
 // TestProxyBasicOperation tests that proxy correctly forwards traffic
@@ -34,7 +35,7 @@ func TestProxyBasicOperation(t *testing.T) {
 	defer registrar.Terminate()
 
 	client := registrar.(*client)
-	node := newMockNode("proxy-test-node")
+	node := newMockNode(t, "proxy-test-node")
 
 	routes := gen.RegisterRoutes{
 		Routes: []gen.Route{{Host: "localhost", Port: 9001, TLS: false}},
@@ -83,7 +84,7 @@ func TestProxyNetworkPartition(t *testing.T) {
 	defer registrar.Terminate()
 
 	client := registrar.(*client)
-	node := newMockNode("partition-node")
+	node := newMockNode(t, "partition-node")
 
 	routes := gen.RegisterRoutes{
 		Routes: []gen.Route{{Host: "localhost", Port: 9001, TLS: false}},
@@ -95,7 +96,7 @@ func TestProxyNetworkPartition(t *testing.T) {
 		t.Fatalf("Failed to register: %v", err)
 	}
 
-	initialLease := client.lease
+	initialLease := client.leaseID()
 	t.Logf("Initial lease: %d", initialLease)
 
 	// SIMULATE NETWORK PARTITION
@@ -121,32 +122,30 @@ func TestProxyNetworkPartition(t *testing.T) {
 	proxy.Unblock()
 	t.Log("Unblocked - network restored")
 
-	// Wait for node to detect network restoration and re-register
-	time.Sleep(3 * time.Second)
-
-	newLease := client.lease
-	t.Logf("New lease after recovery: %d", newLease)
-
-	if newLease == 0 {
-		t.Error("Expected node to re-register after network recovery")
-	}
-
-	if newLease == initialLease {
-		t.Error("Expected new lease after partition recovery")
-	}
-
-	// Verify node is registered in etcd
+	// A closed keepalive channel is checked against the server before anything
+	// is rebuilt, so a lease that outlived the partition is kept and nothing is
+	// republished. Whether the lease is the same or a new one is therefore not
+	// the property to assert, and the check costs up to one TTL before a
+	// re-registration starts. What must hold: the node ends up registered, with
+	// the lease it currently holds.
 	key := client.pathNodes + string(node.Name())
-	getResp, err := client.cli.Get(context.Background(), key)
-	if err != nil {
-		t.Fatalf("Failed to get key: %v", err)
-	}
+	var recoveredLease etcdcli.LeaseID
 
-	if getResp.Count == 0 {
-		t.Fatal("Expected node to be registered after recovery")
-	}
+	waitFor(t, 30*time.Second, func() bool {
+		recoveredLease = client.leaseID()
+		if recoveredLease == 0 {
+			return false
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		resp, err := client.cli.Get(ctx, key)
+		if err != nil || resp.Count == 0 {
+			return false
+		}
+		return resp.Kvs[0].Lease == int64(recoveredLease)
+	}, "node did not recover after the partition")
 
-	t.Logf("Node successfully recovered after partition")
+	t.Logf("Node recovered after partition with lease %d (initial %d)", recoveredLease, initialLease)
 }
 
 // TestProxyRaceCondition tests race between two nodes during partition recovery
@@ -181,7 +180,7 @@ func TestProxyRaceCondition(t *testing.T) {
 	defer registrar1.Terminate()
 
 	client1 := registrar1.(*client)
-	node1 := newMockNode("race-node")
+	node1 := newMockNode(t, "race-node")
 
 	routes := gen.RegisterRoutes{
 		Routes: []gen.Route{{Host: "localhost", Port: 9001, TLS: false}},
@@ -214,7 +213,7 @@ func TestProxyRaceCondition(t *testing.T) {
 	defer registrar2.Terminate()
 
 	client2 := registrar2.(*client)
-	node2 := newMockNode("race-node") // Same name!
+	node2 := newMockNode(t, "race-node") // Same name!
 
 	_, err = client2.Register(node2, routes)
 	if err != nil {
@@ -242,9 +241,9 @@ func TestProxyRaceCondition(t *testing.T) {
 	}
 
 	// Key should be owned by Node2's lease
-	if getResp.Kvs[0].Lease != int64(client2.lease) {
+	if getResp.Kvs[0].Lease != int64(client2.leaseID()) {
 		t.Errorf("Expected Node2 to own the name (lease %d), but got lease %d",
-			client2.lease, getResp.Kvs[0].Lease)
+			client2.leaseID(), getResp.Kvs[0].Lease)
 	}
 
 	t.Log("Node2 correctly retained ownership despite Node1 recovery")
@@ -274,7 +273,7 @@ func TestProxyIntermittentConnection(t *testing.T) {
 	defer registrar.Terminate()
 
 	client := registrar.(*client)
-	node := newMockNode("flaky-node")
+	node := newMockNode(t, "flaky-node")
 
 	routes := gen.RegisterRoutes{
 		Routes: []gen.Route{{Host: "localhost", Port: 9001, TLS: false}},
@@ -285,7 +284,7 @@ func TestProxyIntermittentConnection(t *testing.T) {
 		t.Fatalf("Failed to register: %v", err)
 	}
 
-	initialLease := client.lease
+	initialLease := client.leaseID()
 
 	// Simulate flaky network: drop connections repeatedly
 	for i := 0; i < 3; i++ {
@@ -295,7 +294,7 @@ func TestProxyIntermittentConnection(t *testing.T) {
 	}
 
 	// Lease should be the same (keepAlive reconnected each time)
-	currentLease := client.lease
+	currentLease := client.leaseID()
 	if currentLease != initialLease {
 		t.Errorf("Lease changed from %d to %d (should have survived flaky network)",
 			initialLease, currentLease)
@@ -340,7 +339,7 @@ func TestProxyStatistics(t *testing.T) {
 	defer registrar.Terminate()
 
 	client := registrar.(*client)
-	node := newMockNode("stats-node")
+	node := newMockNode(t, "stats-node")
 
 	routes := gen.RegisterRoutes{
 		Routes: []gen.Route{{Host: "localhost", Port: 9001, TLS: false}},

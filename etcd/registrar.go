@@ -3,12 +3,19 @@ package etcd
 import (
 	"context"
 	"fmt"
+	"math/rand"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"ergo.services/ergo/gen"
 	etcdcli "go.etcd.io/etcd/client/v3"
+)
+
+var (
+	errLeaseLost = fmt.Errorf("etcd lease lost")
+	errWatchLost = fmt.Errorf("etcd watch could not be restored")
 )
 
 // gen.Registrar interface implementation
@@ -25,8 +32,8 @@ func (c *client) Register(node gen.NodeRegistrar, routes gen.RegisterRoutes) (ge
 		eventRef, err := node.RegisterEvent(eventName, gen.EventOptions{})
 		if err != nil {
 			// Clean up: revoke the lease since keepRegistration won't start
-			c.cli.Revoke(context.Background(), c.lease)
-			c.lease = 0
+			c.revokeLease(c.leaseID())
+			c.setLeaseID(0)
 			atomic.StoreInt32(&c.state, 0)
 			return gen.StaticRoutes{}, err
 		}
@@ -55,18 +62,66 @@ func (c *client) RegisterApplicationRoute(route gen.ApplicationRoute) error {
 	if err != nil {
 		return err
 	}
-	c.cli.Put(context.Background(), key, value, etcdcli.WithLease(c.lease))
-	return nil
+
+	// keepRegistration can replace the lease at any moment. A Put that landed on
+	// the previous lease is about to be deleted along with it, so make sure the
+	// lease is still current and redo the Put otherwise.
+	for attempt := 1; ; attempt++ {
+		lease := c.leaseID()
+
+		ctx, cancel := c.requestContext()
+		_, err := c.cli.Put(ctx, key, value, etcdcli.WithLease(lease))
+		cancel()
+		if err != nil {
+			return err
+		}
+		if c.leaseID() == lease {
+			return nil
+		}
+		if attempt == 3 {
+			// Give up racing. The route stays in c.apps, so the re-registration
+			// that replaced the lease will publish it anyway.
+			c.node.Log().Debug("(registrar) lease kept changing while registering route %s", route.Name)
+			return nil
+		}
+	}
 }
 func (c *client) UnregisterApplicationRoute(name gen.Atom) error {
 	c.apps.Delete(name)
 	key := c.pathApps + string(name) + "/" + string(c.node.Name())
-	c.cli.Delete(context.Background(), key)
+
+	ctx, cancel := c.requestContext()
+	defer cancel()
+
+	if _, err := c.cli.Delete(ctx, key); err != nil {
+		return err
+	}
 	return nil
 }
 
+// Nodes answers from the mirror: no RPC, cannot block. Suspects are listed so
+// membership, resolve and events tell one story; a clean shutdown announces
+// itself and is gone from here at once.
 func (c *client) Nodes() ([]gen.Atom, error) {
-	resp, err := c.cli.Get(context.Background(), c.pathNodes, etcdcli.WithPrefix())
+	c.mirror.lock.RLock()
+	if c.mirror.seeded {
+		nodes := make([]gen.Atom, 0, len(c.mirror.nodes))
+		for name := range c.mirror.nodes {
+			if name == c.node.Name() {
+				continue // skip self
+			}
+			nodes = append(nodes, name)
+		}
+		c.mirror.lock.RUnlock()
+		sort.Slice(nodes, func(i, j int) bool { return nodes[i] < nodes[j] })
+		return nodes, nil
+	}
+	c.mirror.lock.RUnlock()
+
+	ctx, cancel := c.requestContext()
+	defer cancel()
+
+	resp, err := c.cli.Get(ctx, c.pathNodes, etcdcli.WithPrefix())
 	if err != nil {
 		return nil, err
 	}
@@ -191,6 +246,7 @@ func (c *client) Event() (gen.Event, error) {
 
 func (c *client) Info() gen.RegistrarInfo {
 	return gen.RegistrarInfo{
+		Server:                     strings.Join(c.options.Endpoints, ","),
 		EmbeddedServer:             false,
 		Version:                    c.Version(),
 		SupportConfig:              true,
@@ -206,11 +262,16 @@ func (c *client) Version() gen.Version {
 
 func (c *client) Terminate() {
 	atomic.StoreInt32(&c.state, 2) // set state to terminated
-	c.cancel()                     // cancel main context - stops KeepAlive immediately
-	if c.lease != 0 {
+
+	// Announce and remove before the context is cancelled: after c.cancel()
+	// every request derived from it fails immediately.
+	c.departGracefully()
+
+	c.cancel() // cancel main context - stops KeepAlive immediately
+	if lease := c.leaseID(); lease != 0 {
 		// Use timeout since main context is already cancelled
 		revokeCtx, revokeCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		c.cli.Revoke(revokeCtx, c.lease)
+		c.cli.Revoke(revokeCtx, lease)
 		revokeCancel()
 	}
 	c.cli.Close()
@@ -221,8 +282,38 @@ func (c *client) Terminate() {
 
 // internals
 
+// leaseID returns the lease the node is currently registered with.
+func (c *client) leaseID() etcdcli.LeaseID {
+	return etcdcli.LeaseID(c.lease.Load())
+}
+
+func (c *client) setLeaseID(lease etcdcli.LeaseID) {
+	c.lease.Store(int64(lease))
+}
+
+// requestContext bounds one etcd RPC. clientv3 defaults to WaitForReady(true),
+// so a call without a deadline blocks for as long as etcd is unreachable.
+func (c *client) requestContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(c.ctx, c.options.RequestTimeout)
+}
+
+// revokeLease releases the lease on a best-effort basis. Uses a standalone
+// context so cleanup still runs when the client context is already cancelled.
+func (c *client) revokeLease(lease etcdcli.LeaseID) {
+	if lease == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), c.options.RequestTimeout)
+	defer cancel()
+	if _, err := c.cli.Revoke(ctx, lease); err != nil {
+		if c.node != nil {
+			c.node.Log().Debug("(registrar) unable to revoke lease %d: %s", lease, err)
+		}
+	}
+}
+
 func (c *client) keepRegistration() {
-	initialLease := c.lease
+	initialLease := c.leaseID()
 
 	for iteration := 0; ; iteration++ {
 		// New context for each iteration - derives from c.ctx (cancelled by Terminate)
@@ -236,9 +327,16 @@ func (c *client) keepRegistration() {
 			c.node.Log().Info("(registrar) starting with initial lease %d", currentLease)
 		} else {
 			// Reconnection: create new registration
-			c.node.Log().Info("(registrar) attempting to re-register (iteration %d)", iteration)
+			c.statSessionRebuilt.Add(1)
+			c.node.Log().Info("(registrar) attempting to re-register (iteration %d). "+
+				"sessions revived %d, rebuilt %d; watches resumed %d, resynced %d; "+
+				"mirror seeded %d times; routes resolved from suspect %d, expired after grace %d",
+				iteration,
+				c.statSessionRevived.Load(), c.statSessionRebuilt.Load(),
+				c.statWatchResumed.Load(), c.statWatchResync.Load(), c.statSeeds.Load(),
+				c.statResolvedFromSuspect.Load(), c.statExpiredAfterGrace.Load())
 
-			oldLease := c.lease
+			oldLease := c.leaseID()
 
 			// Retry loop with exponential backoff
 			for attempt := 1; ; attempt++ {
@@ -273,7 +371,7 @@ func (c *client) keepRegistration() {
 
 			}
 
-			currentLease = c.lease
+			currentLease = c.leaseID()
 		}
 
 		// Start KeepAlive with iteration context
@@ -289,54 +387,76 @@ func (c *client) keepRegistration() {
 			continue
 		}
 
-		// Drop lazy app-route cache before starting the new Watch.
-		// During disconnect we lost events, so cached entries may be stale.
-		// Clearing here (before Watch starts) avoids a window where the new
-		// watcher feeds events into stale entries that we would only clear
-		// afterwards. Next ResolveApplication calls will re-fetch on miss.
-		c.appCacheLock.Lock()
-		c.appCache = make(map[gen.Atom]*appEntry)
-		c.appCacheLock.Unlock()
+		// Snapshot first, then watch from seedRev+1: the handover misses nothing
+		// and replays nothing. reconcile decides per entry what a gone key means.
+		seedRev, err := c.seedMirror()
+		if err != nil {
+			c.node.Log().Error("(registrar) failed to seed the cluster mirror: %v", err)
+			iterCancel()
+			if !c.waitWithContext(c.ctx, 5*time.Second) {
+				return
+			}
+			continue
+		}
 
-		// Start Watch with iteration context
-		watchCh := c.cli.Watch(iterCtx, pathPrefix, etcdcli.WithPrefix())
+		watchRev := seedRev + 1
+		watchCh := c.startWatch(iterCtx, watchRev)
 
 		// Load configuration
 		c.loadConfiguration()
 		c.node.Log().Info("(registrar) keepalive active for lease %d", currentLease)
 
+		// The clock only runs while the watch is up: with no session we have no
+		// evidence about anyone.
+		sweepTicker := time.NewTicker(c.options.SweepInterval)
+
+		c.sendEvent(EventRegistrarConnected{Info: c.Info()})
+
 		// Main event loop
 		disconnected := false
+		disconnectReason := error(nil)
+		watchFailures := 0
 		for !disconnected {
 			select {
 			case resp, ok := <-keepAliveCh:
 				if !ok {
-					c.node.Log().Warning("(registrar) keepalive channel closed")
-					disconnected = true
-					break
+					// Not necessarily a lost lease. Ask before rebuilding.
+					revived, ch := c.reviveLease(iterCtx, currentLease)
+					if revived == false {
+						disconnected = true
+						disconnectReason = errLeaseLost
+						break
+					}
+					keepAliveCh = ch
+					continue
 				}
 				if resp != nil {
 					c.node.Log().Trace("(registrar) keepalive response: TTL=%d", resp.TTL)
 				}
 
+			case <-sweepTicker.C:
+				c.sweepMirror()
+
 			case watchResp, ok := <-watchCh:
-				if !ok {
-					c.node.Log().Warning("(registrar) watch channel closed")
-					disconnected = true
-					break
+				if ok == false || watchResp.Err() != nil {
+					// A broken watch is not a broken registration.
+					ch, rev, recovered := c.recoverWatch(iterCtx, watchResp, ok, watchRev, &watchFailures)
+					if recovered == false {
+						disconnected = true
+						disconnectReason = errWatchLost
+						break
+					}
+					watchCh, watchRev = ch, rev
+					continue
 				}
 
-				if watchResp.Err() != nil {
-					c.node.Log().Error("(registrar) watch error: %v", watchResp.Err())
-					disconnected = true
-					break
-				}
-
-				for _, event := range watchResp.Events {
-					c.handleEvent(event)
-				}
+				watchFailures = 0
+				c.applyWatchResponse(watchResp)
+				watchRev = watchNextRev(watchResp, watchRev)
 			}
 		}
+
+		sweepTicker.Stop()
 
 		// CRITICAL: Cancel context to stop keepAlive and watch goroutines
 		c.node.Log().Debug("(registrar) cancelling iteration context")
@@ -364,33 +484,419 @@ func (c *client) keepRegistration() {
 
 		// Reset state to unregistered for re-registration attempt
 		atomic.StoreInt32(&c.state, 0)
+		c.sendEvent(EventRegistrarDisconnected{Reason: disconnectReason})
 
 		c.node.Log().Warning("(registrar) will attempt re-registration")
 		// Continue to next iteration
 	}
 }
 
-// handleEvent processes all types of events from the single watcher
-func (c *client) handleEvent(event *etcdcli.Event) {
-	key := string(event.Kv.Key)
-
-	// Route based on path prefix
-	switch {
-	case strings.HasPrefix(key, c.pathNodes):
-		c.node.Log().Debug("(registrar) node event: %s %s", event.Type, key)
-		c.handleNodeEvent(event)
-	case strings.HasPrefix(key, c.pathApps):
-		c.node.Log().Debug("(registrar) application event: %s %s", event.Type, key)
-		c.handleApplicationEvent(event)
-	case strings.HasPrefix(key, c.pathConfig):
-		c.node.Log().Debug("(registrar) config event: %s %s", event.Type, key)
-		c.handleConfigEvent(event, c.pathConfig)
-	case strings.HasPrefix(key, c.pathGlobalConfig):
-		c.node.Log().Debug("(registrar) global config event: %s %s", event.Type, key)
-		c.handleConfigEvent(event, c.pathGlobalConfig)
-	default:
-		c.node.Log().Debug("(registrar) ignoring event for unhandled path: %s", key)
+// departGracefully announces the shutdown before removing this node's keys:
+// without it a rolling deploy looks exactly like the failure the grace exists
+// for. A separate key, not a flag in the node value, so older registrars ignore
+// it instead of failing to decode. Best effort, the lease revoke covers it.
+func (c *client) departGracefully() {
+	if c.node == nil {
+		return
 	}
+
+	name := string(c.node.Name())
+
+	ctx, cancel := context.WithTimeout(context.Background(), c.options.RequestTimeout)
+	defer cancel()
+
+	marker, err := c.cli.Grant(ctx, c.leaseTTL)
+	if err != nil {
+		c.node.Log().Debug("(registrar) unable to announce departure: %s", err)
+		return
+	}
+	if _, err := c.cli.Put(ctx, c.pathLeaving+name, "", etcdcli.WithLease(marker.ID)); err != nil {
+		c.node.Log().Debug("(registrar) unable to announce departure: %s", err)
+		return
+	}
+
+	ops := make([]etcdcli.Op, 0, 4)
+	c.apps.Range(func(app any, _ any) bool {
+		ops = append(ops, etcdcli.OpDelete(c.pathApps+string(app.(gen.Atom))+"/"+name))
+		return true
+	})
+	ops = append(ops, etcdcli.OpDelete(c.pathNodes+name))
+
+	if _, err := c.cli.Txn(ctx).Then(ops...).Commit(); err != nil {
+		c.node.Log().Debug("(registrar) unable to remove own keys on shutdown: %s", err)
+		return
+	}
+
+	c.node.Log().Info("(registrar) announced departure and removed %d key(s)", len(ops))
+}
+
+// startWatch opens the cluster watch. WithProgressNotify keeps the resume point
+// moving while the cluster is quiet, so a reconnect does not ask for a revision
+// old enough to have been compacted away.
+func (c *client) startWatch(ctx context.Context, rev int64) etcdcli.WatchChan {
+	return c.cli.Watch(ctx, pathPrefix,
+		etcdcli.WithPrefix(),
+		etcdcli.WithRev(rev),
+		etcdcli.WithProgressNotify(),
+	)
+}
+
+// watchNextRev follows the rule clientv3 uses internally (watch.go:851-856):
+// past the last event when there are events, past the header otherwise. Taking
+// the header while events are present would skip everything in between.
+func watchNextRev(resp etcdcli.WatchResponse, current int64) int64 {
+	if n := len(resp.Events); n > 0 {
+		return resp.Events[n-1].Kv.ModRevision + 1
+	}
+	if resp.Header == nil { // only a response we built ourselves
+		return current
+	}
+	if resp.Header.Revision > 0 {
+		return resp.Header.Revision + 1
+	}
+	return current
+}
+
+// reviveLease re-arms KeepAlive on the same lease. clientv3 closes that channel
+// both on a real expiry (lease.go:530) and after one TTL of silence
+// (deadlineLoop, lease.go:558); re-arming asks the server instead of guessing.
+func (c *client) reviveLease(ctx context.Context, lease etcdcli.LeaseID) (bool, <-chan *etcdcli.LeaseKeepAliveResponse) {
+	c.node.Log().Warning("(registrar) keepalive channel closed, checking whether lease %d is still alive", lease)
+
+	ch, err := c.cli.KeepAlive(ctx, lease)
+	if err != nil {
+		c.node.Log().Warning("(registrar) lease %d cannot be kept alive: %v", lease, err)
+		return false, nil
+	}
+
+	// One TTL: no answer within it means the lease is expiring anyway.
+	budget := time.Duration(c.leaseTTL) * time.Second
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+
+	select {
+	case resp, ok := <-ch:
+		if ok == false || resp == nil || resp.TTL <= 0 {
+			c.node.Log().Warning("(registrar) lease %d is gone, re-registering", lease)
+			return false, nil
+		}
+		c.statSessionRevived.Add(1)
+		c.node.Log().Info("(registrar) session recovered on lease %d, TTL=%d, nothing republished", lease, resp.TTL)
+		return true, ch
+
+	case <-timer.C:
+		c.node.Log().Warning("(registrar) lease %d did not answer within %v, re-registering", lease, budget)
+		return false, nil
+
+	case <-ctx.Done():
+		return false, nil
+	}
+}
+
+// recoverWatch rebuilds the watch stream in place, leaving the session alone.
+// Returns false when recovery keeps failing and the session must be rebuilt.
+// ok reports whether the channel is still open.
+func (c *client) recoverWatch(
+	ctx context.Context,
+	resp etcdcli.WatchResponse,
+	ok bool,
+	rev int64,
+	failures *int,
+) (etcdcli.WatchChan, int64, bool) {
+	*failures++
+
+	switch {
+	case ok == false:
+		c.node.Log().Warning("(registrar) watch channel closed, resuming at revision %d", rev)
+	case resp.CompactRevision > 0:
+		// Position compacted away, only a fresh snapshot can catch up.
+		c.node.Log().Warning("(registrar) watch revision %d compacted away (compact revision %d), resyncing",
+			rev, resp.CompactRevision)
+		seedRev, err := c.seedMirror()
+		if err != nil {
+			c.node.Log().Error("(registrar) resync after compaction failed: %v", err)
+			break
+		}
+		c.statWatchResync.Add(1)
+		rev = seedRev + 1
+		*failures = 0
+	default:
+		c.node.Log().Warning("(registrar) watch failed: %v, resuming at revision %d", resp.Err(), rev)
+	}
+
+	if *failures > watchRecoveryAttempts {
+		c.node.Log().Error("(registrar) watch could not be restored in %d attempts, rebuilding the session",
+			watchRecoveryAttempts)
+		return nil, rev, false
+	}
+
+	// Full jitter: a fleet must not come back in lockstep.
+	shift := *failures - 1
+	if shift < 0 {
+		shift = 0 // a successful resync cleared the counter
+	}
+	if shift > 8 {
+		shift = 8
+	}
+	backoff := watchRetryMin << shift
+	if backoff > watchRetryMax {
+		backoff = watchRetryMax
+	}
+	if backoff > 0 {
+		backoff = time.Duration(rand.Int63n(int64(backoff)) + 1)
+	}
+	if c.waitWithContext(ctx, backoff) == false {
+		return nil, rev, false
+	}
+
+	c.statWatchResumed.Add(1)
+	return c.startWatch(ctx, rev), rev, true
+}
+
+// seedMirror loads the cluster state into the mirror and returns the revision
+// the snapshot was taken at. The watch must then be started at that revision
+// plus one.
+func (c *client) seedMirror() (int64, error) {
+	ctx, cancel := c.requestContext()
+	defer cancel()
+
+	// One transaction so every range is read at the same revision, and scoped to
+	// this cluster: the watch prefix is shared, a bulk read must not be.
+	resp, err := c.cli.Txn(ctx).Then(
+		etcdcli.OpGet(c.pathNodes, etcdcli.WithPrefix()),
+		etcdcli.OpGet(c.pathApps, etcdcli.WithPrefix()),
+		etcdcli.OpGet(c.pathLeaving, etcdcli.WithPrefix()),
+	).Commit()
+	if err != nil {
+		return 0, err
+	}
+
+	nodes := make(map[gen.Atom][]gen.Route)
+	for _, kv := range resp.Responses[0].GetResponseRange().Kvs {
+		name := gen.Atom(strings.TrimPrefix(string(kv.Key), c.pathNodes))
+		routes, err := decodeRoutes(kv.Value)
+		if err != nil {
+			c.node.Log().Error("(registrar) failed to decode routes of node %s: %v", name, err)
+			continue
+		}
+		nodes[name] = routes
+	}
+
+	apps := make(map[gen.Atom]map[gen.Atom]gen.ApplicationRoute)
+	for _, kv := range resp.Responses[1].GetResponseRange().Kvs {
+		appName, nodeName, ok := c.splitApplicationKey(string(kv.Key))
+		if ok == false {
+			continue
+		}
+		route, err := decodeApplicationRoute(kv.Value)
+		if err != nil {
+			c.node.Log().Error("(registrar) failed to decode application route %s: %v", kv.Key, err)
+			continue
+		}
+		if apps[appName] == nil {
+			apps[appName] = make(map[gen.Atom]gen.ApplicationRoute)
+		}
+		apps[appName][nodeName] = route
+	}
+
+	leaving := make(map[gen.Atom]struct{})
+	for _, kv := range resp.Responses[2].GetResponseRange().Kvs {
+		leaving[gen.Atom(strings.TrimPrefix(string(kv.Key), c.pathLeaving))] = struct{}{}
+	}
+
+	c.mirror.reconcile(nodes, apps, leaving, resp.Header.Revision, c.graceTicks)
+	c.statSeeds.Add(1)
+	c.node.Log().Info("(registrar) mirror seeded at revision %d: %d node(s), %d application(s), %d suspect route(s)",
+		resp.Header.Revision, len(nodes), len(apps), c.mirror.suspectCount())
+
+	return resp.Header.Revision, nil
+}
+
+// sweepMirror advances the suspicion clock and publishes what the grace
+// confirmed. An inferred loss is announced only here, so a node that comes back
+// in time costs the cluster no event at all.
+func (c *client) sweepMirror() {
+	routes, nodes := c.mirror.sweep()
+	if len(routes) == 0 && len(nodes) == 0 {
+		return
+	}
+
+	c.statExpiredAfterGrace.Add(int64(len(routes)))
+	c.node.Log().Info("(registrar) suspicion expired, dropped %d application route(s) and %d node(s)",
+		len(routes), len(nodes))
+
+	for _, route := range routes {
+		c.sendEvent(EventApplicationStopped{Name: route.app, Node: route.node})
+	}
+	for _, name := range nodes {
+		if name == c.node.Name() {
+			continue
+		}
+		c.node.Log().Info("(registrar) node %s left cluster", name)
+		c.sendEvent(EventNodeLeft{Name: name})
+	}
+}
+
+// applyWatchResponse applies one watch response and publishes what it implies.
+// Events are grouped by revision, node keys first: a lease expiry removes both
+// in one revision with no ordering inside it, so classifying application
+// deletes against the node state of that revision is the only stable rule.
+func (c *client) applyWatchResponse(resp etcdcli.WatchResponse) {
+	// Decode before the lock, publish after it: resolve readers must not wait.
+	parsed := c.parseWatchEvents(resp.Events)
+
+	var pending []any
+
+	c.mirror.lock.Lock()
+	for start := 0; start < len(parsed); {
+		rev := parsed[start].rev
+		end := start
+		for end < len(parsed) && parsed[end].rev == rev {
+			end++
+		}
+		group := parsed[start:end]
+		start = end
+
+		// Announcements first: they decide how deletions in the same revision read.
+		for _, event := range group {
+			if event.kind == eventLeaving {
+				c.mirror.setLeaving(event.node, event.put)
+			}
+		}
+		for _, event := range group {
+			if event.kind == eventNode {
+				pending = append(pending, c.applyNodeEvent(event)...)
+			}
+		}
+		for _, event := range group {
+			if event.kind == eventApplication {
+				pending = append(pending, c.applyApplicationEvent(event)...)
+			}
+		}
+
+		if rev > c.mirror.rev {
+			c.mirror.rev = rev
+		}
+	}
+	c.mirror.lock.Unlock()
+
+	for _, event := range parsed {
+		switch event.kind {
+		case eventClusterConfig:
+			c.handleConfigEvent(event.raw, c.pathConfig)
+		case eventGlobalConfig:
+			c.handleConfigEvent(event.raw, c.pathGlobalConfig)
+		}
+	}
+
+	for _, event := range pending {
+		switch ev := event.(type) {
+		case EventNodeJoined:
+			c.node.Log().Info("(registrar) node %s joined cluster", ev.Name)
+		case EventNodeLeft:
+			c.node.Log().Info("(registrar) node %s left cluster", ev.Name)
+		}
+		c.sendEvent(event)
+	}
+}
+
+const (
+	eventOther = iota
+	eventLeaving
+	eventNode
+	eventApplication
+	eventClusterConfig
+	eventGlobalConfig
+)
+
+// watchEvent is a decoded watch event, ready to apply.
+type watchEvent struct {
+	kind   int
+	rev    int64
+	put    bool
+	node   gen.Atom
+	app    gen.Atom
+	routes []gen.Route          // node key value
+	route  gen.ApplicationRoute // application key value
+	raw    *etcdcli.Event       // config events are handled as they were
+}
+
+// parseWatchEvents decodes and classifies a batch, dropping malformed entries.
+func (c *client) parseWatchEvents(events []*etcdcli.Event) []watchEvent {
+	parsed := make([]watchEvent, 0, len(events))
+
+	for _, event := range events {
+		key := string(event.Kv.Key)
+		put := event.Type == etcdcli.EventTypePut
+		item := watchEvent{rev: event.Kv.ModRevision, put: put, raw: event}
+
+		switch {
+		case strings.HasPrefix(key, c.pathLeaving):
+			item.kind = eventLeaving
+			item.node = gen.Atom(strings.TrimPrefix(key, c.pathLeaving))
+
+		case strings.HasPrefix(key, c.pathNodes):
+			item.kind = eventNode
+			item.node = gen.Atom(strings.TrimPrefix(key, c.pathNodes))
+			if put {
+				routes, err := decodeRoutes(event.Kv.Value)
+				if err != nil {
+					c.node.Log().Error("(registrar) failed to decode routes of node %s: %v", item.node, err)
+					continue
+				}
+				item.routes = routes
+			}
+
+		case strings.HasPrefix(key, c.pathApps):
+			app, node, ok := c.splitApplicationKey(key)
+			if ok == false {
+				continue
+			}
+			item.kind = eventApplication
+			item.app, item.node = app, node
+			if put {
+				route, err := decodeApplicationRoute(event.Kv.Value)
+				if err != nil {
+					c.node.Log().Error("(registrar) failed to decode application route %s: %v", key, err)
+					continue
+				}
+				item.route = route
+			}
+
+		case strings.HasPrefix(key, c.pathConfig):
+			c.node.Log().Debug("(registrar) config event: %s %s", event.Type, key)
+			item.kind = eventClusterConfig
+
+		case strings.HasPrefix(key, c.pathGlobalConfig):
+			c.node.Log().Debug("(registrar) global config event: %s %s", event.Type, key)
+			item.kind = eventGlobalConfig
+
+		default:
+			c.node.Log().Debug("(registrar) ignoring event for unhandled path: %s", key)
+			continue
+		}
+
+		parsed = append(parsed, item)
+	}
+
+	return parsed
+}
+
+// sendEvent publishes one registrar event.
+func (c *client) sendEvent(event any) {
+	if err := c.node.SendEvent(c.event.Name, c.eventRef, gen.MessageOptions{}, event); err != nil {
+		c.node.Log().Error("(registrar) failed to send %T: %v", event, err)
+	}
+}
+
+// splitApplicationKey extracts the application and node names.
+func (c *client) splitApplicationKey(key string) (gen.Atom, gen.Atom, bool) {
+	parts := strings.Split(strings.TrimPrefix(key, c.pathApps), "/")
+	if len(parts) != 2 {
+		c.node.Log().Warning("(registrar) invalid application key format: %s", key)
+		return "", "", false
+	}
+	return gen.Atom(parts[0]), gen.Atom(parts[1]), true
 }
 
 // loadConfiguration loads all configuration items from etcd
@@ -412,7 +918,10 @@ func (c *client) loadConfiguration() {
 
 // loadConfigFromPath loads configuration items from a specific etcd path
 func (c *client) loadConfigFromPath(configPath, configType string) {
-	resp, err := c.cli.Get(context.Background(), configPath, etcdcli.WithPrefix())
+	ctx, cancel := c.requestContext()
+	defer cancel()
+
+	resp, err := c.cli.Get(ctx, configPath, etcdcli.WithPrefix())
 	if err != nil {
 		c.node.Log().Error("(registrar) failed to load %s configuration from %s: %v", configType, configPath, err)
 		return
@@ -629,166 +1138,69 @@ func compareValues(a, b any) bool {
 	return a == b
 }
 
-// handleClusterEvent processes cluster-related events (nodes, applications)
-func (c *client) handleClusterEvent(event *etcdcli.Event) {
-	switch {
-	case strings.HasPrefix(string(event.Kv.Key), c.pathNodes):
-		c.handleNodeEvent(event)
-	case strings.HasPrefix(string(event.Kv.Key), c.pathApps):
-		c.handleApplicationEvent(event)
-	default:
-		c.node.Log().Warning("(registrar) unknown cluster event key: %s", event.Kv.Key)
+// applyNodeEvent updates the mirror and returns the events to publish. The node
+// key is the liveness signal of its owner.
+// Caller must hold c.mirror.lock.
+func (c *client) applyNodeEvent(event watchEvent) []any {
+	self := event.node == c.node.Name()
+
+	if event.put {
+		c.mirror.putNode(event.node, event.routes)
+		if self {
+			return nil
+		}
+		return []any{EventNodeJoined{Name: event.node}}
 	}
+
+	if c.mirror.isLeaving(event.node) == false {
+		// Not the owner's word, so nothing is announced yet: the sweep will, if
+		// the node is still gone when the grace ends.
+		c.mirror.suspectNode(event.node, c.graceTicks())
+		return nil
+	}
+
+	c.mirror.removeNode(event.node)
+	if self {
+		return nil
+	}
+	return []any{EventNodeLeft{Name: event.node}}
 }
 
-// handleNodeEvent processes node join/leave events
-func (c *client) handleNodeEvent(event *etcdcli.Event) {
-	// Extract node name from key
-	nodeName := gen.Atom(strings.TrimPrefix(string(event.Kv.Key), c.pathNodes))
+// Caller must hold c.mirror.lock.
+func (c *client) applyApplicationEvent(event watchEvent) []any {
+	if event.put {
+		c.mirror.putAppRoute(event.app, event.node, event.route, event.rev)
 
-	if nodeName == c.node.Name() {
-		c.node.Log().Debug("(registrar) ignoring event for self node: %s", nodeName)
-		return
-	}
-
-	switch event.Type {
-	case etcdcli.EventTypePut:
-		// Node joined
-		ev := EventNodeJoined{Name: nodeName}
-		if err := c.node.SendEvent(c.event.Name, c.eventRef, gen.MessageOptions{}, ev); err != nil {
-			c.node.Log().Error("(registrar) failed to send node joined event: %v", err)
-		} else {
-			c.node.Log().Info("(registrar) node %s joined cluster", nodeName)
-		}
-
-	case etcdcli.EventTypeDelete:
-		// Node left
-		ev := EventNodeLeft{Name: nodeName}
-		if err := c.node.SendEvent(c.event.Name, c.eventRef, gen.MessageOptions{}, ev); err != nil {
-			c.node.Log().Error("(registrar) failed to send node left event: %v", err)
-		} else {
-			c.node.Log().Info("(registrar) node %s left cluster", nodeName)
-		}
-	}
-}
-
-// handleApplicationEvent processes application lifecycle events
-func (c *client) handleApplicationEvent(event *etcdcli.Event) {
-	// Extract application name and node from key
-	// Format: pathApps + appName + "/" + nodeName
-	keyWithoutPrefix := strings.TrimPrefix(string(event.Kv.Key), c.pathApps)
-	parts := strings.Split(keyWithoutPrefix, "/")
-
-	if len(parts) != 2 {
-		c.node.Log().Warning("(registrar) invalid application key format: %s", event.Kv.Key)
-		return
-	}
-
-	appName := gen.Atom(parts[0])
-	nodeName := gen.Atom(parts[1])
-
-	switch event.Type {
-	case etcdcli.EventTypePut:
-		// Application started/updated
-		route, err := decode(event.Kv.Value)
-		if err != nil {
-			c.node.Log().Error("(registrar) failed to decode application route: %v", err)
-			return
-		}
-
-		appRoute, ok := route.(gen.ApplicationRoute)
-		if ok == false {
-			c.node.Log().Error("(registrar) invalid application route type: %T", route)
-			return
-		}
-
-		// Update cache before emitting the framework event so receivers
-		// that call ResolveApplication see the fresh state.
-		c.updateAppCachePut(appName, nodeName, appRoute, event.Kv.ModRevision)
-
-		// Send appropriate event based on application state
-		switch appRoute.State {
+		switch event.route.State {
 		case gen.ApplicationStateLoaded:
-			ev := EventApplicationLoaded{
-				Name:   appName,
-				Node:   nodeName,
-				Weight: appRoute.Weight,
-			}
-			if err := c.node.SendEvent(c.event.Name, c.eventRef, gen.MessageOptions{}, ev); err != nil {
-				c.node.Log().Error("(registrar) failed to send application loaded event: %v", err)
-			}
-
+			return []any{EventApplicationLoaded{
+				Name:   event.app,
+				Node:   event.node,
+				Weight: event.route.Weight,
+			}}
 		case gen.ApplicationStateRunning:
-			ev := EventApplicationStarted{
-				Name:   appName,
-				Node:   nodeName,
-				Weight: appRoute.Weight,
-				Mode:   appRoute.Mode,
-			}
-			if err := c.node.SendEvent(c.event.Name, c.eventRef, gen.MessageOptions{}, ev); err != nil {
-				c.node.Log().Error("(registrar) failed to send application started event: %v", err)
-			}
-
+			return []any{EventApplicationStarted{
+				Name:   event.app,
+				Node:   event.node,
+				Weight: event.route.Weight,
+				Mode:   event.route.Mode,
+			}}
 		case gen.ApplicationStateStopping:
-			ev := EventApplicationStopping{
-				Name: appName,
-				Node: nodeName,
-			}
-			if err := c.node.SendEvent(c.event.Name, c.eventRef, gen.MessageOptions{}, ev); err != nil {
-				c.node.Log().Error("(registrar) failed to send application stopping event: %v", err)
-			}
+			return []any{EventApplicationStopping{Name: event.app, Node: event.node}}
 		}
-
-	case etcdcli.EventTypeDelete:
-		// Update cache before emitting the framework event.
-		c.updateAppCacheDelete(appName, nodeName, event.Kv.ModRevision)
-
-		// Application stopped/unloaded
-		ev := EventApplicationStopped{
-			Name: appName,
-			Node: nodeName,
-		}
-		if err := c.node.SendEvent(c.event.Name, c.eventRef, gen.MessageOptions{}, ev); err != nil {
-			c.node.Log().Error("(registrar) failed to send application stopped event: %v", err)
-		}
+		return nil
 	}
-}
 
-// updateAppCachePut applies a PUT watch event to the app cache if it's newer
-// than the entry's stored revision. Entries with no prior resolve are ignored
-// (a future ResolveApplication will fetch fresh state on miss).
-func (c *client) updateAppCachePut(appName, nodeName gen.Atom, route gen.ApplicationRoute, rev int64) {
-	c.appCacheLock.Lock()
-	defer c.appCacheLock.Unlock()
+	if c.mirror.nodeLive(event.node) == false && c.mirror.isLeaving(event.node) == false {
+		// Nobody vouched for this: keep serving it, deprioritized, and stay
+		// quiet until the grace runs out.
+		c.mirror.suspectAppRoute(event.app, event.node, c.graceTicks(), event.rev)
+		return nil
+	}
 
-	entry, ok := c.appCache[appName]
-	if ok == false {
-		return
-	}
-	if rev <= entry.rev {
-		return
-	}
-	if entry.routes == nil {
-		entry.routes = make(map[gen.Atom]gen.ApplicationRoute)
-	}
-	entry.routes[nodeName] = route
-	entry.rev = rev
-}
-
-// updateAppCacheDelete applies a DELETE watch event to the app cache.
-func (c *client) updateAppCacheDelete(appName, nodeName gen.Atom, rev int64) {
-	c.appCacheLock.Lock()
-	defer c.appCacheLock.Unlock()
-
-	entry, ok := c.appCache[appName]
-	if ok == false {
-		return
-	}
-	if rev <= entry.rev {
-		return
-	}
-	delete(entry.routes, nodeName)
-	entry.rev = rev
+	// The owner is there, or announced its departure: its own doing.
+	c.mirror.removeAppRoute(event.app, event.node, event.rev)
+	return []any{EventApplicationStopped{Name: event.app, Node: event.node}}
 }
 
 func (c *client) tryRegister() (gen.StaticRoutes, error) {
@@ -798,39 +1210,43 @@ func (c *client) tryRegister() (gen.StaticRoutes, error) {
 		return noStaticRoutes, gen.ErrRegistrarTerminated
 	}
 
-	leaseResponse, err := c.cli.Grant(context.Background(), c.leaseTTL)
+	grantCtx, grantCancel := c.requestContext()
+	leaseResponse, err := c.cli.Grant(grantCtx, c.leaseTTL)
+	grantCancel()
 	if err != nil {
 		return noStaticRoutes, err
 	}
-	c.lease = leaseResponse.ID
+	lease := leaseResponse.ID
+	c.setLeaseID(lease)
 
 	key := c.pathNodes + string(c.node.Name())
 	value, err := encode(c.routes)
 	if err != nil {
 		// Clean up lease on encode error
-		c.cli.Revoke(context.Background(), c.lease)
-		c.lease = 0
+		c.revokeLease(lease)
+		c.setLeaseID(0)
 		return noStaticRoutes, err
 	}
 
 	// register node with routes (protected: only if key doesn't exist)
-	tx := c.cli.Txn(context.Background())
-	txResult, err := tx.
+	txCtx, txCancel := c.requestContext()
+	txResult, err := c.cli.Txn(txCtx).
 		If(etcdcli.Compare(etcdcli.CreateRevision(key), "=", 0)).
-		Then(etcdcli.OpPut(key, value, etcdcli.WithLease(c.lease))).
+		Then(etcdcli.OpPut(key, value, etcdcli.WithLease(lease))).
 		Commit()
+	txCancel()
 
 	if err != nil {
 		// Clean up lease on transaction error
-		c.cli.Revoke(context.Background(), c.lease)
-		c.lease = 0
+		c.revokeLease(lease)
+		c.setLeaseID(0)
 		return noStaticRoutes, err
 	}
 
 	if txResult.Succeeded == false {
 		// Clean up lease if key already exists
-		c.cli.Revoke(context.Background(), c.lease)
-		c.lease = 0
+		c.revokeLease(lease)
+		c.setLeaseID(0)
 		return noStaticRoutes, gen.ErrTaken
 	}
 
@@ -846,11 +1262,9 @@ func (c *client) tryRegister() (gen.StaticRoutes, error) {
 	return noStaticRoutes, nil
 }
 
-// tryReRegister performs re-registration after disconnect.
-// Creates a new lease FIRST, then attempts to register using two strategies:
-// 1. Key doesn't exist (old lease expired) - create it
-// 2. Key exists with our old lease (reconnected before expiry) - replace lease
-// Old lease is revoked only AFTER successful re-registration.
+// tryReRegister takes a new lease first, then claims the node key either as a
+// fresh key (old lease expired) or by replacing the old lease on it. The old
+// lease is revoked only after every key has moved to the new one.
 func (c *client) tryReRegister(oldLease etcdcli.LeaseID) error {
 	if atomic.LoadInt32(&c.state) == 2 {
 		return gen.ErrRegistrarTerminated
@@ -859,7 +1273,9 @@ func (c *client) tryReRegister(oldLease etcdcli.LeaseID) error {
 	key := c.pathNodes + string(c.node.Name())
 
 	// Create new lease first (before touching old one)
-	leaseResponse, err := c.cli.Grant(context.Background(), c.leaseTTL)
+	grantCtx, grantCancel := c.requestContext()
+	leaseResponse, err := c.cli.Grant(grantCtx, c.leaseTTL)
+	grantCancel()
 	if err != nil {
 		return fmt.Errorf("failed to create new lease: %w", err)
 	}
@@ -868,58 +1284,68 @@ func (c *client) tryReRegister(oldLease etcdcli.LeaseID) error {
 
 	value, err := encode(c.routes)
 	if err != nil {
-		c.cli.Revoke(context.Background(), newLease)
+		c.revokeLease(newLease)
 		return fmt.Errorf("failed to encode routes: %w", err)
 	}
 
 	// Attempt 1: key doesn't exist (old lease expired, key was deleted)
-	txResult, err := c.cli.Txn(context.Background()).
+	tx1Ctx, tx1Cancel := c.requestContext()
+	txResult, err := c.cli.Txn(tx1Ctx).
 		If(etcdcli.Compare(etcdcli.CreateRevision(key), "=", 0)).
 		Then(etcdcli.OpPut(key, value, etcdcli.WithLease(newLease))).
 		Commit()
+	tx1Cancel()
 	if err != nil {
-		c.cli.Revoke(context.Background(), newLease)
+		c.revokeLease(newLease)
 		return fmt.Errorf("failed to execute transaction: %w", err)
 	}
 
 	// Attempt 2: key exists with our old lease (reconnected before expiry)
 	if txResult.Succeeded == false && oldLease != 0 {
-		txResult, err = c.cli.Txn(context.Background()).
+		tx2Ctx, tx2Cancel := c.requestContext()
+		txResult, err = c.cli.Txn(tx2Ctx).
 			If(etcdcli.Compare(etcdcli.LeaseValue(key), "=", int64(oldLease))).
 			Then(etcdcli.OpPut(key, value, etcdcli.WithLease(newLease))).
 			Commit()
+		tx2Cancel()
 		if err != nil {
-			c.cli.Revoke(context.Background(), newLease)
+			c.revokeLease(newLease)
 			return fmt.Errorf("failed to execute transaction: %w", err)
 		}
 	}
 
 	if txResult.Succeeded == false {
 		// Both attempts failed - another node registered this name
-		c.cli.Revoke(context.Background(), newLease)
+		c.revokeLease(newLease)
 		c.node.Log().Error("(registrar) key was taken by another node during re-registration")
 		return gen.ErrTaken
 	}
 
 	// Success
-	c.lease = newLease
+	c.setLeaseID(newLease)
 	atomic.StoreInt32(&c.state, 1)
-	c.node.Log().Info("(registrar) successfully re-registered with lease %d", c.lease)
+	c.node.Log().Info("(registrar) successfully re-registered with lease %d", newLease)
 
-	// Revoke old lease (best effort, no keys attached anymore)
-	if oldLease != 0 {
-		revokeCtx, revokeCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		c.cli.Revoke(revokeCtx, oldLease)
-		revokeCancel()
-	}
-
-	// Re-register applications
+	// Re-attach before revoking: a Put with the new lease rewrites the key, so
+	// watchers see a PUT. Revoking first would delete every app key still held by
+	// the old lease and make a healthy node look like it left.
+	reattached := true
 	c.apps.Range(func(k any, v any) bool {
 		if err := c.RegisterApplicationRoute(v.(gen.ApplicationRoute)); err != nil {
 			c.node.Log().Error("(registrar) unable to register application route: %s", err)
+			reattached = false
 		}
 		return true
 	})
+
+	if reattached == true {
+		c.revokeLease(oldLease)
+		return nil
+	}
+
+	// Some app keys are still on the old lease. Let it expire by TTL instead of
+	// turning a failed re-attach into a delete event for those routes.
+	c.node.Log().Warning("(registrar) not all application routes were re-attached, leaving lease %d to expire", oldLease)
 
 	return nil
 }

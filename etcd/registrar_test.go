@@ -133,9 +133,14 @@ func TestDefaultValues(t *testing.T) {
 }
 
 func TestClientInfo(t *testing.T) {
-	client := &client{}
+	client := &client{
+		options: Options{Endpoints: []string{"etcd1:2379", "etcd2:2379"}},
+	}
 	info := client.Info()
 
+	if info.Server != "etcd1:2379,etcd2:2379" {
+		t.Errorf("Expected Server to list the endpoints, got %q", info.Server)
+	}
 	if info.EmbeddedServer {
 		t.Error("Expected EmbeddedServer to be false")
 	}

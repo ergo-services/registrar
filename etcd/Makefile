@@ -18,7 +18,9 @@ help:
 # Test configuration
 ETCD_ENDPOINTS := localhost:12379
 GO_TEST_TIMEOUT := 300s
-TEST_FLAGS := -timeout $(GO_TEST_TIMEOUT)
+# -count=1 is the documented way to bypass the test cache: without it a second run
+# reports the first one's result and nothing is executed
+TEST_FLAGS := -timeout $(GO_TEST_TIMEOUT) -count=1
 
 # Start etcd container
 start-etcd:
@@ -123,7 +125,7 @@ test-ci:
 install-tools:
 	@echo "Installing required tools..."
 	@command -v etcdctl >/dev/null 2>&1 || (echo "Installing etcdctl..." && \
-		ETCD_VER=v3.5.13 && \
+		ETCD_VER=v3.6.4 && \
 		curl -L https://github.com/etcd-io/etcd/releases/download/$${ETCD_VER}/etcd-$${ETCD_VER}-darwin-amd64.tar.gz -o /tmp/etcd.tar.gz && \
 		tar xzf /tmp/etcd.tar.gz -C /tmp && \
 		sudo mv /tmp/etcd-$${ETCD_VER}-darwin-amd64/etcdctl /usr/local/bin/ && \

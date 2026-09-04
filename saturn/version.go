@@ -12,6 +12,6 @@ var (
 	Version = gen.Version{
 		Name:    clientName,
 		Release: clientRelease,
-		License: gen.LicenseBSL1,
+		License: gen.LicenseMIT,
 	}
 )

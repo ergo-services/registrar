@@ -2,9 +2,11 @@ package etcd
 
 import (
 	"encoding/base64"
+	"fmt"
 	"strconv"
 	"strings"
 
+	"ergo.services/ergo/gen"
 	"ergo.services/ergo/lib"
 	"ergo.services/ergo/net/edf"
 )
@@ -62,6 +64,32 @@ func encode(value any) (string, error) {
 	str := base64.StdEncoding.EncodeToString(b.B)
 
 	return str, nil
+}
+
+// decodeRoutes decodes the value of a node key.
+func decodeRoutes(data []byte) ([]gen.Route, error) {
+	value, err := decode(data)
+	if err != nil {
+		return nil, err
+	}
+	routes, ok := value.([]gen.Route)
+	if ok == false {
+		return nil, fmt.Errorf("unexpected type %T", value)
+	}
+	return routes, nil
+}
+
+// decodeApplicationRoute decodes the value of an application route key.
+func decodeApplicationRoute(data []byte) (gen.ApplicationRoute, error) {
+	value, err := decode(data)
+	if err != nil {
+		return gen.ApplicationRoute{}, err
+	}
+	route, ok := value.(gen.ApplicationRoute)
+	if ok == false {
+		return gen.ApplicationRoute{}, fmt.Errorf("unexpected type %T", value)
+	}
+	return route, nil
 }
 
 // decode decodes general data without type conversion
